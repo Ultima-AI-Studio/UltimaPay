@@ -1,0 +1,10 @@
+.superpowers/
+backend/.venv/
+backend/ultimapay.db
+backend/*.db
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+tasks/queue/dispatch-*-prompt.txt
+tasks/queue/run-*.log
+

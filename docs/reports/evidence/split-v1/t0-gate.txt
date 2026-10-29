@@ -1,0 +1,24 @@
+Gate T0 evidence — 2026-10-29 Asia/Shanghai
+
+RED
+Command: cd backend && python -m pytest tests/test_t0_service.py -q
+Result: exit 1; 1 failed.
+Expected failure: ModuleNotFoundError: No module named 'app'.
+
+DEPENDENCIES
+Command: cd backend && python -m venv .venv && .venv/Scripts/python.exe -m pip install -r requirements.txt
+Result: exit 0.
+Imports: fastapi 0.149.0; uvicorn 0.54.0; httpx 0.28.1; pytest 9.1.1; qrcode 8.2; pillow 12.0.0.
+
+GREEN
+Command: cd backend && .venv/Scripts/python.exe -m pytest tests/test_t0_service.py -q
+Result: exit 0; 1 passed in 0.52s; no warnings.
+
+REAL PROCESS
+Command: cd backend && .venv/Scripts/python.exe run.py
+Gold listener on 127.0.0.1:8912: False.
+UltimaPay listener: 127.0.0.1:8061, PID 23060.
+GET http://127.0.0.1:8061/health: HTTP 200.
+Body: {"status":"ok","time":"2026-10-29 20:04:31"}
+The exact server session was stopped after the probe; port 8061 had no listener afterward.
+
