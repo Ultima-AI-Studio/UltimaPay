@@ -137,14 +137,24 @@ def ensure_payment_base_schema(db: sqlite3.Connection) -> None:
         ("PAY-SMOKE-001", "smoke_user", "smoke@example.invalid", "active", now),
     )
     merchants = (
-        ("ultima-gold", "Ultima Gold 官方站点", "ops@ultima.ai", "upay_live_ultimagold00000000000001"),
-        ("ultima-agent", "Ultima Agent 官方站点", "ops@ultima.ai", "upay_live_ultimaagent0000000000002"),
-        ("console", "Ultima AI Console 后台", "ops@ultima.ai", "upay_live_console0000000000000003"),
+        ("ultima-gold", "Ultima Gold 官方站点", "ops@ultima.ai"),
+        ("ultima-agent", "Ultima Agent 官方站点", "ops@ultima.ai"),
+        ("console", "Ultima AI Console 后台", "ops@ultima.ai"),
     )
     db.executemany(
         "INSERT OR IGNORE INTO payment_merchants"
-        "(code,name,email,api_key,status,enabled,created_at) VALUES(?,?,?,?,'active',1,?)",
+        "(code,name,email,api_key,status,enabled,created_at) VALUES(?,?,?,'','pending_config',0,?)",
         [(*row, now) for row in merchants],
+    )
+    public_seed_keys = (
+        ("ultima-gold", "upay_live_ultimagold00000000000001"),
+        ("ultima-agent", "upay_live_ultimaagent0000000000002"),
+        ("console", "upay_live_console0000000000000003"),
+    )
+    db.executemany(
+        "UPDATE payment_merchants SET api_key='',status='pending_config',enabled=0"
+        " WHERE code=? AND api_key=?",
+        public_seed_keys,
     )
     db.commit()
 

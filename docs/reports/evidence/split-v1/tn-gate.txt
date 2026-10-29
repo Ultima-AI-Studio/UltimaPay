@@ -1,0 +1,46 @@
+Gate Tn — total acceptance, independent audit, and freeze
+Date: 2026-10-29 (Asia/Shanghai)
+
+1. Frozen prerequisite tags (peeled commits)
+   - T0 e1356691f0c31ad8a64e84b66a3c7ab171e56108
+   - T1 a5607376f8ccfd9828874e9f19d1ffaf679e7d35
+   - T2 8fa3c27da697ae629771ee836d8942ffab969cc4
+   - T3 d9924646a2e599f92ebf3d324e86f0e3fd4878b6
+   - T4 b881692176487d2f1f1db468a04782046bc2f379
+   - T5 00d1f519ffb5552c5efc1b240883c363b80a4d60
+
+2. Independent review
+   - Critical: 0
+   - Important: 4; all reproduced with failing tests, fixed, and covered by regression tests.
+   - Resolved: user-order idempotency/core allocation, PayWindow identity signature, merchant idempotency/session ownership, cold-database seed credentials.
+   - Full disposition: docs/reports/split-v1-audit.md
+
+3. Final current-tree verification
+   - backend pytest: 22 passed in 1.47s
+   - backend compileall: PASS
+   - T4 Gold-detached boundary: 4 passed in 0.68s
+   - Gold UGP-27/28 non-payment regression: 6 passed in 0.36s
+   - Gold live Python AST parse: 243 files, PASS
+   - SDK Vitest: 10 passed; CJS/ESM/DTS build PASS
+   - PayWindow Node identity contract: 1 passed; TypeScript/Vite build PASS
+   - forward patch reverse-check: exit 0
+   - reverse patch forward-check: exit 0
+   - unauthorized retired-brand matches in UltimaPay: 0
+   - Gold live payment ownership/path matches: 0
+   - git diff --check: PASS
+
+4. Gold-down independent process proof
+   - Gold port 8912 listeners: 0
+   - Started only UltimaPay on 8061 with a fresh standalone SQLite database.
+   - health 200; same signed order request repeated twice returned the same order; QR 200 image/png; receipt 200 submitted.
+   - Database proof: payment_orders count 1; namespaced idempotency key present; amount_units, asset_key, allocation_key populated; active exposed seed keys count 0.
+   - Exact service process stopped; 8061 listeners after stop: 0; temporary database deleted.
+
+5. Environment and hygiene
+   - Windows PowerShell, Asia/Shanghai; Python isolated at backend/.venv.
+   - pnpm link creation is unsupported on this H: host; npm --no-package-lock was used only for SDK verification.
+   - Dependency/build directories were deleted after verification; no package-lock or temporary evidence entered the repository.
+   - Gold has no Git repository; reversible forward/reverse patches remain the required recovery evidence.
+   - No remote is configured for the UltimaPay Git repository; no push was attempted.
+
+Gate Tn: PASS

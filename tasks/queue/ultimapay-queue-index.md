@@ -8,14 +8,14 @@
 
 | 工单数 | 待派发 | 执行中 | 审计中 | 阻塞 | 已冻结 |
 |---|---|---|---|---|---|
-| 1 | 0 | 1 | 0 | 0 | 0 |
+| 1 | 0 | 0 | 0 | 0 | 1 |
 
 ## 二、工单明细
 
 | 工单 | 标题 | 状态 | 前置冻结 | 验收门 | 依据 |
 |---|---|---|---|---|---|
-| wo-ultimapay-20261029-0001 | UltimaPay｜重构｜从 UltimaGold 拆出为独立支付产品 | 执行中 | 无 | stage-split-v1.md + wo-ultimapay-20261029-0001-frozen | 用户 2026-10-29 明确要求拆干净（业务逻辑/后端/DB/路由不再捆绑 Gold） |
+| wo-ultimapay-20261029-0001 | UltimaPay｜重构｜从 UltimaGold 拆出为独立支付产品 | 已冻结 | 无 | stage-split-v1.md + wo-ultimapay-20261029-0001-frozen | T0–Tn 全绿；独立审计 4 项重要发现均已修复；用户要求的支付逻辑/后端/DB/路由与 Gold 解耦完成 |
 
 ## 三、回执与证据
 
-（待 Codex 回执后回填：完成状态 / 根因结论 / 产出路径 / 验收证据 / 越界声明 / 环境声明）
+标准化 8 字段回执见 `docs/reports/stage-split-v1.md`；审计见 `docs/reports/split-v1-audit.md`；最终证据见 `docs/reports/evidence/split-v1/tn-gate.txt`。

@@ -1,6 +1,6 @@
 # Ultima Pay · 支付窗口（前端 SDK 组件）
 
-**产品无关的可嵌入支付窗口**：需求方产品只需传「用户 + 套餐/商品 ID」，组件自动完成
+**产品无关的可嵌入支付窗口**：需求方产品传入「用户 + 宿主签名 + 套餐/商品 ID」，组件自动完成
 「拉起订单（金额服务端锁死）→ 选链 → 钱包直付 / 二维码兜底 → 轮询确认 → 结果回传」。
 
 技术栈：React 18 + Chakra UI + Vite + TypeScript（复用原 examples 骨架，重构为收款场景）。
@@ -12,6 +12,7 @@ import PayWindow from './components/PayWindow';
 
 <PayWindow
   username={user.uid}        // 用户标识（官网由登录态传入）
+  userSignature={user.paySignature} // 宿主服务端签发；不得在浏览器保存签名密钥
   planId="SP-02"             // 套餐/商品 ID（金额由服务端按此锁定）
   planName="季卡"             // 展示名（可选）
   onResult={(r) => {
@@ -23,11 +24,12 @@ import PayWindow from './components/PayWindow';
 
 组件内部流程：
 
-1. `POST /api/pay/order` 拉起订单 → 服务端锁定金额（套餐价 + 防撞尾数，唯一）
-2. 检测已装钱包扩展（`window.tronWeb` 等）→ 就绪则「唤起钱包支付」签名转账
-3. 无钱包 → 自动降级：显示收款二维码（含精确金额）+ 地址复制
-4. 每 5s 轮询 `GET /api/pay/order?orderNo=` → confirmed/expired 收敛
-5. 钱包直付成功后立即提交回执（`POST /payment/confirm`，服务端校验金额+哈希防重）加速确认
+1. 宿主服务端签发当前用户身份，通过 `userSignature` 传入；SDK 不持有签名密钥
+2. `POST /api/pay/order` 拉起订单 → 服务端锁定金额（套餐价 + 防撞尾数，唯一）
+3. 检测已装钱包扩展（`window.tronWeb` 等）→ 就绪则「唤起钱包支付」签名转账
+4. 无钱包 → 自动降级：显示收款二维码（含精确金额）+ 地址复制
+5. 每 5s 轮询 `GET /api/pay/order?orderNo=` → confirmed/expired 收敛
+6. 钱包直付成功后提交回执（`POST /api/pay/confirm`，只进入待链上核验）
 
 ## 组件结构
 

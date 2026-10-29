@@ -33,7 +33,7 @@ _ALLOC_LOCK = threading.Lock()
 
 def _merchant_valid(db, merchant):
     """商户有效性：存在且启用。无效商户 key 一律拒绝（调用方不得回退官方站）。"""
-    if not merchant:
+    if merchant in (None, '', 'ultima-gold'):
         return True   # 平台自有下单（ultima-gold）不走商户凭据
     row = db.execute('SELECT code, enabled FROM payment_merchants WHERE code=?', (merchant,)).fetchone()
     return bool(row) and bool(row[1])
@@ -117,6 +117,11 @@ def create_payment_intent(db, principal, product_ref, chain, idempotency_key,
             hit = db.execute("SELECT * FROM payment_orders WHERE idempotency_key=? ORDER BY id DESC LIMIT 1",
                              (idempotency_key,)).fetchone()
             if hit:
+                expected_username = principal.get('username') or principal.get('merchant') or ''
+                expected_merchant = (merchant or '').strip() or 'ultima-gold'
+                if (hit['username'] != expected_username or hit['plan_id'] != plan.get('id')
+                        or hit['channel'] != chain or hit['merchant'] != expected_merchant):
+                    return None, '幂等键已绑定不同下单参数'
                 return hit, None
         # 4) 商户归属：无效商户已拒绝；有效商户不能回退官方站
         merchant = (merchant or '').strip() or 'ultima-gold'
@@ -159,6 +164,11 @@ def create_payment_intent(db, principal, product_ref, chain, idempotency_key,
                 hit = db.execute("SELECT * FROM payment_orders WHERE idempotency_key=? ORDER BY id DESC LIMIT 1",
                                  (idempotency_key,)).fetchone()
                 if hit:
+                    expected_username = principal.get('username') or principal.get('merchant') or ''
+                    expected_merchant = (merchant or '').strip() or 'ultima-gold'
+                    if (hit['username'] != expected_username or hit['plan_id'] != plan.get('id')
+                            or hit['channel'] != chain or hit['merchant'] != expected_merchant):
+                        return None, '幂等键已绑定不同下单参数'
                     return hit, None
             return None, '金额分配并发冲突，请重试'
     return db.execute('SELECT * FROM payment_orders WHERE order_no=?', (order_no,)).fetchone(), None

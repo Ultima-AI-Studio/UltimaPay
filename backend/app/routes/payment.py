@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse, Response
 
 from .. import payments
 from ..auth import policy
-from ..payments import merchant_api
+from ..payments import merchant_api, orders as payment_orders
 from ..storage import ensure_payment_base_schema, open_connection
 
 
@@ -209,19 +209,24 @@ def save_merchant(body: dict, authorization: str | None = Header(default=None)):
         ).fetchone()
         addresses = tuple(str(body.get(key) or "").strip() for key in
                           ("tronAddress", "ethAddress", "bscAddress", "solAddress"))
-        if current and tuple(current[index] or "" for index in range(2, 6)) != addresses:
+        current_addresses = tuple(current[index] or "" for index in range(2, 6)) if current else ()
+        unprovisioned_seed = bool(current and not current[0] and not any(current_addresses))
+        if current and not unprovisioned_seed and current_addresses != addresses:
             return _error(400, "收款地址已固化不可变更，如需换址请提交工单")
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        api_key = current[0] if current else "upay_live_" + secrets.token_hex(12)
-        state = current[1] if current else "active"
+        api_key = current[0] if current and current[0] else "upay_live_" + secrets.token_hex(12)
+        state = current[1] if current and current[0] else "active"
         secret = str(body.get("secret") or "").strip() if "secret" in body else (current[6] if current else "")
-        stored_addresses = tuple(current[index] for index in range(2, 6)) if current else addresses
+        stored_addresses = addresses if not current or unprovisioned_seed else current_addresses
         db.execute(
             "INSERT INTO payment_merchants(code,name,email,api_key,status,callback_url,secret,enabled,"
             "remark,created_at,tron_address,eth_address,bsc_address,sol_address)"
             " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             " ON CONFLICT(code) DO UPDATE SET name=excluded.name,email=excluded.email,"
-            "callback_url=excluded.callback_url,secret=excluded.secret,enabled=excluded.enabled,remark=excluded.remark",
+            "api_key=excluded.api_key,status=excluded.status,callback_url=excluded.callback_url,"
+            "secret=excluded.secret,enabled=excluded.enabled,remark=excluded.remark,"
+            "tron_address=excluded.tron_address,eth_address=excluded.eth_address,"
+            "bsc_address=excluded.bsc_address,sol_address=excluded.sol_address",
             (code, name, str(body.get("email") or "").strip(), api_key, state,
              str(body.get("callbackUrl") or "").strip(), secret,
              1 if body.get("enabled", True) else 0, str(body.get("remark") or "").strip(),
@@ -427,9 +432,19 @@ def create_order(
             if not row:
                 return _error(401, "商户凭据无效，不回退平台商户")
             merchant = row[0]
-        row, error = payments.create_payment_order(
-            db, principal["username"], body.get("planId") or "",
-            body.get("channel") or "TRON", merchant
+        raw_idempotency_key = str(body.get("idempotencyKey") or "").strip()
+        idempotency_key = (
+            f"user:{principal['username']}:{raw_idempotency_key}"
+            if raw_idempotency_key else None
+        )
+        row, error = payment_orders.create_payment_intent(
+            db,
+            principal,
+            payments.LEGACY_PRODUCT_REF,
+            str(body.get("channel") or "TRON").upper(),
+            idempotency_key,
+            plan_id=body.get("planId") or "",
+            merchant=merchant,
         )
         if error:
             return _error(400, error)

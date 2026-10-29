@@ -37,10 +37,21 @@ async function json<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 /** 拉起订单（金额由服务端锁死：套餐价 + 防撞尾数；幂等键由窗口生命周期固定 → 重复挂载/重试单订单） */
-export function createOrder(user: string, planId: string, channel = 'TRON', idempotencyKey?: string) {
+export function createOrder(
+  user: string,
+  userSignature: string,
+  planId: string,
+  channel = 'TRON',
+  idempotencyKey?: string,
+) {
+  if (!userSignature) throw new Error('宿主应用未提供支付用户签名');
   return json<PayOrder>(`${API}/order`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Pay-User': user,
+      'X-Pay-Signature': userSignature,
+    },
     body: JSON.stringify({ user, planId, channel, idempotencyKey }),
   });
 }

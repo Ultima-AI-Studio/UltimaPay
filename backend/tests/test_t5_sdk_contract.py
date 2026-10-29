@@ -32,7 +32,9 @@ def test_sdk_uses_standalone_base_url_and_canonical_routes():
 
     assert "http://127.0.0.1:8061" in api
     assert "/api/pay" in api
+    assert "X-Pay-User" in api and "X-Pay-Signature" in api
     assert "getChannels" in api and "getChannels" in component
+    assert "userSignature" in component
     assert "'/api/pay'" in vite
     assert "http://127.0.0.1:8061" in vite
     assert not (SDK_ROOT / "node_modules").exists()

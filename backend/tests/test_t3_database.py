@@ -77,8 +77,9 @@ def test_merchant_intent_and_order_scoped_session_routes_on_cold_database():
         database.migrate()
         connection = database.connection()
         connection.execute(
-            "UPDATE payment_merchants SET tron_address=? WHERE code='ultima-gold'",
-            ("TStandaloneMerchantAddress",),
+            "UPDATE payment_merchants SET tron_address=?,api_key=?,status='active',enabled=1"
+            " WHERE code='ultima-gold'",
+            ("TStandaloneMerchantAddress", "test-merchant-key"),
         )
         connection.commit()
         connection.close()
@@ -100,7 +101,7 @@ def test_merchant_intent_and_order_scoped_session_routes_on_cold_database():
                     )
                     assert denied.status_code == 401
 
-                    headers = {"X-Pay-Key": "upay_live_ultimagold00000000000001"}
+                    headers = {"X-Pay-Key": "test-merchant-key"}
                     first = await client.post(
                         "/api/pay/merchant/intents",
                         headers=headers,

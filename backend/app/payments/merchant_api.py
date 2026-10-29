@@ -35,6 +35,23 @@ def _merchant_address(row, chain):
             (row['sol_address'] or '').strip() if chain == 'SOL' else '')
 
 
+def _idempotency_key(merchant, client_key):
+    return 'merchant:%s:%s' % (merchant, client_key)
+
+
+def _same_intent(hit, merchant, external_order_no, external_user_ref,
+                 amount_units, chain, receive):
+    return bool(
+        hit
+        and hit['merchant'] == merchant
+        and hit['plan_id'] == external_order_no
+        and hit['username'] == external_user_ref
+        and int(hit['amount_units'] or 0) == int(amount_units)
+        and hit['channel'] == chain
+        and hit['receive_address'] == receive
+    )
+
+
 def create_merchant_intent(db, merchant, external_order_no, external_user_ref,
                            amount_units, chain, idempotency_key=None, now=None, ttl_minutes=None):
     """外部商户创建支付意图（纯逻辑）：
@@ -57,11 +74,16 @@ def create_merchant_intent(db, merchant, external_order_no, external_user_ref,
     if not asset:
         return None, None, '不支持的支付链 %s（未登记资产/通道停用）' % chain
 
-    # 幂等：外部订单号唯一（同单重复 → 返回同一订单与会话，不生成多笔）
-    if idempotency_key or external_order_no:
+    # 幂等按已认证商户命名空间隔离；同一键参数冲突必须拒绝，不能返回他人订单。
+    client_key = idempotency_key or external_order_no
+    storage_key = _idempotency_key(merchant, client_key)
+    if client_key:
         hit = db.execute("SELECT * FROM payment_orders WHERE idempotency_key=? ORDER BY id DESC LIMIT 1",
-                         (idempotency_key or external_order_no,)).fetchone()
+                         (storage_key,)).fetchone()
         if hit:
+            if not _same_intent(hit, merchant, external_order_no, external_user_ref,
+                                amount_units, chain, receive):
+                return None, None, '幂等键已绑定不同商户订单参数'
             tok = _issue_session(db, hit['order_no'], merchant, now, ttl_minutes)
             return hit, tok, None
 
@@ -77,14 +99,17 @@ def create_merchant_intent(db, merchant, external_order_no, external_user_ref,
             " VALUES(?,?,?,?,?,?,?,?,'pending',?,?,?,?,?,?,?,?,?)",
             (order_no, external_user_ref, external_order_no, '商户商品', 0, 1.0, 0, 0, now,
              (datetime.strptime(now, '%Y-%m-%d %H:%M:%S') + timedelta(minutes=ttl_minutes or 30)).strftime('%Y-%m-%d %H:%M:%S'),
-             chain, merchant, receive, idempotency_key or external_order_no, amount_units, asset_key,
+             chain, merchant, receive, storage_key, amount_units, asset_key,
              '%s|%s' % (receive, asset_key)))
         db.commit()
     except sqlite3.IntegrityError:
         db.rollback()
         hit = db.execute("SELECT * FROM payment_orders WHERE idempotency_key=? ORDER BY id DESC LIMIT 1",
-                         (idempotency_key or external_order_no,)).fetchone()
+                         (storage_key,)).fetchone()
         if hit:
+            if not _same_intent(hit, merchant, external_order_no, external_user_ref,
+                                amount_units, chain, receive):
+                return None, None, '幂等键已绑定不同商户订单参数'
             tok = _issue_session(db, hit['order_no'], merchant, now, ttl_minutes)
             return hit, tok, None
         return None, None, '并发冲突，请重试'
@@ -95,6 +120,9 @@ def create_merchant_intent(db, merchant, external_order_no, external_user_ref,
 
 def _issue_session(db, order_no, merchant, now, ttl_minutes=None):
     """签发短期限、订单作用域支付会话（session_token 绑定单一订单，过期即失效）。"""
+    owner = db.execute('SELECT merchant FROM payment_orders WHERE order_no=?', (order_no,)).fetchone()
+    if not owner or owner['merchant'] != merchant:
+        raise ValueError('不能为其他商户订单签发支付会话')
     token = 'ps_' + secrets.token_hex(16)
     expires = (datetime.strptime(now, '%Y-%m-%d %H:%M:%S')
                + timedelta(minutes=ttl_minutes or SESSION_TTL_MINUTES)).strftime('%Y-%m-%d %H:%M:%S')
@@ -121,5 +149,7 @@ def resolve_pay_session(db, session_token, order_no, now=None):
     order = db.execute('SELECT * FROM payment_orders WHERE order_no=?', (order_no,)).fetchone()
     if not order:
         return None, '订单不存在'
+    if s['merchant'] != order['merchant']:
+        return None, '支付会话商户与订单商户不一致'
     return order, None
 

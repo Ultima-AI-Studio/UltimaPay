@@ -31,6 +31,7 @@ const SOLANA_RPC = 'https://api.mainnet-beta.solana.com';
 
 export interface PayWindowProps {
   username: string;          // 用户标识
+  userSignature: string;     // 宿主服务端签发；SDK 不持有签名密钥
   planId: string;            // 套餐/商品标识（金额由服务端按此锁定）
   planName?: string;         // 展示名
   amountUsdt?: number;       // 展示参考（实际以服务端订单为准）
@@ -69,7 +70,7 @@ const buildChannels = (p: Probe, srv?: Record<string, { address: string; enabled
   ];
 };
 
-export default function PayWindow({ username, planId, planName, amountUsdt, onResult }: PayWindowProps) {
+export default function PayWindow({ username, userSignature, planId, planName, amountUsdt, onResult }: PayWindowProps) {
   const toast = useToast();
   const [stage, setStage] = useState<WindowStage>('creating');
   const [order, setOrder] = useState<PayOrder | null>(null);
@@ -83,7 +84,9 @@ export default function PayWindow({ username, planId, planName, amountUsdt, onRe
   // 幂等键：组件生命周期固定一次（重复挂载/切链/重试共用 → 服务端同键单订单）
   const coreRef = useRef(createPayCore({
     username, planId,
-    api: { createOrder, getOrder, confirmOrder,
+    api: { createOrder: (user, product, selectedChannel, idempotencyKey) =>
+             createOrder(user, userSignature, product, selectedChannel, idempotencyKey),
+           getOrder, confirmOrder,
            channels: async () => { /* 由下方独立 useEffect 拉取服务端通道配置 */ return {}; } },
   }));
 

@@ -18,6 +18,7 @@ const PLANS = [
 
 export default function App() {
   const [username, setUsername] = useState('gold_hunter');
+  const [userSignature, setUserSignature] = useState('');
   const [planId, setPlanId] = useState('SP-02');
   const [paying, setPaying] = useState(false);
   const [result, setResult] = useState<string>('');
@@ -61,14 +62,15 @@ export default function App() {
           </CardHeader>
           <CardBody>
             <Input value={username} onChange={(e) => setUsername(e.target.value)} placeholder="输入用户 UID / 用户名" size="sm" />
-            <Text fontSize="xs" color="gray.400" mt={2}>官网对接后由登录态自动传入</Text>
+            <Input mt={2} value={userSignature} onChange={(e) => setUserSignature(e.target.value)} placeholder="宿主服务端签发的支付用户签名" size="sm" />
+            <Text fontSize="xs" color="gray.400" mt={2}>正式接入时由登录态自动传入，浏览器不保存签名密钥</Text>
           </CardBody>
         </Card>
 
         {!paying ? (
           <Button
             colorScheme="purple" size="lg"
-            isDisabled={plan.price === 0 || !username.trim()}
+            isDisabled={plan.price === 0 || !username.trim() || !userSignature.trim()}
             onClick={() => { setResult(''); setPaying(true); }}
           >
             下一步：加密支付（{plan.name} · {plan.price} USDT）
@@ -77,6 +79,7 @@ export default function App() {
           <Stack spacing={3}>
             <PayWindow
               username={username.trim()}
+              userSignature={userSignature.trim()}
               planId={plan.id}
               planName={plan.name}
               amountUsdt={plan.price}
