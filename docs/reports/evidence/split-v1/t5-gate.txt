@@ -1,0 +1,31 @@
+Gate T5 — SDK and project documentation migration
+Date: 2026-10-29 (Asia/Shanghai)
+
+1. Project entry
+   - docs/INDEX.md maps root authority, workflow, work order, queue, report/evidence, directories, start command, port 8061, canonical API and database boundary.
+   - README.md identifies UltimaPay as an independent process/database/service and links the project index.
+
+2. SDK migration
+   - Copied 71 source/configuration files from the former Gold SDK while excluding nested Git metadata, node_modules, dist and logs.
+   - Updated PayWindow API default to http://127.0.0.1:8061/api/pay.
+   - Centralized channel loading through the SDK API helper; Vite proxy now targets 127.0.0.1:8061.
+   - Regenerated the stale PayWindow pnpm lock to include its declared Solana dependencies.
+   - Gold old SDK source/dependencies/build output removed after verification; only sdk/README.md migration redirect remains.
+
+3. Test-first evidence
+   - RED: test_t5_sdk_contract.py initially failed 3/3 because docs/INDEX.md, README.md and sdk/ were absent and Gold docs still referenced the retired service.
+   - GREEN: `python -m pytest tests/test_t5_sdk_contract.py -q` -> 3 passed in 0.03s.
+
+4. SDK verification
+   - PayWindow: npm install --no-package-lock; `npm run build` -> TypeScript PASS, Vite 1403 modules transformed, build PASS in 7.11s.
+   - Root SDK: npm install --no-package-lock; Vitest 1 file / 10 tests PASS; tsup CJS/ESM/DTS build PASS.
+   - Non-failing observations: PayWindow bundle reports a >500 kB chunk; root dependency audit reports 5 upstream vulnerabilities (1 low, 2 moderate, 2 critical); root prepare reports nested `.git` absent. No dependency upgrade or UI rewrite is authorized in this work order.
+   - Environment ruling: pnpm 12 isolated symlink creation repeatedly failed on H:; hoisted install completed but build-script policy stopped esbuild. Kept pnpm lock/config as project source and used npm without generating package-lock.json solely for verification.
+
+5. Naming and temporary-state gates
+   - UltimaPay README/docs INDEX/SDK/backend (excluding the explicit compatibility constant and immutable evidence): zero retired-brand matches.
+   - UltimaPay tests: zero retired-brand matches.
+   - Gold live payment README/guide/SDK redirect (excluding immutable design-shot metadata and reference material): zero retired-brand matches.
+   - Generated node_modules/dist directories removed from both SDK packages after verification; none are tracked or left in the product tree.
+
+Gate T5: PASS

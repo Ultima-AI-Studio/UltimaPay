@@ -21,6 +21,6 @@
 | T2 | PASS | `evidence/split-v1/t2-gate.txt`：pytest 8/8；OpenAPI 17 条 `/api/pay/*`；Gold 停机时真实冷启动/订单/查询/二维码/鉴权全绿；循环心跳可见；Gold 原支付路由与循环零命中 |
 | T3 | PASS | `evidence/split-v1/t3-gate.txt`：pytest 11/11；独立冷库首次迁移 `[9]`、重跑 `[]`；m009 字段/索引原样；会话单订单隔离 200/403；Gold m009 所有权零残留 |
 | T4 | PASS | `evidence/split-v1/t4-gate.txt`：Gold 支付包/路由/循环/会话迁移所有权已移除；正反补丁双向校验 0；边界测试 4/4、非支付回归 6/6；Gold 8912 停止时独立真实 HTTP 冒烟全绿 |
-| T5 | 未开始 | — |
+| T5 | PASS | `evidence/split-v1/t5-gate.txt`：项目 INDEX/README 就绪；SDK 完整迁入并改为 8061 + `/api/pay/*`；Python 契约 3/3、SDK Vitest 10/10、PayWindow 与根 SDK 构建通过；Gold 仅留迁移指向 |
 | Tn | 未开始 | — |
 
