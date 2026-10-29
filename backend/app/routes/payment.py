@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse, Response
 
 from .. import payments
 from ..auth import policy
+from ..payments import merchant_api
 from ..storage import ensure_payment_base_schema, open_connection
 
 
@@ -440,6 +441,68 @@ def create_order(
                     "createdAt": item["createdAt"], "expiredAt": item["expiredAt"],
                     "address": item["receiveAddress"] or channel.get("address") or cfg["address"],
                     "ttlMinutes": cfg["ttlMinutes"]})
+    finally:
+        db.close()
+
+
+@router.post("/merchant/intents")
+def create_merchant_intent(body: dict, x_pay_key: str | None = Header(default=None)):
+    merchant = str(body.get("merchant") or "").strip()
+    db = _db()
+    try:
+        principal, reason = policy.merchant_principal(db, merchant, x_pay_key or "")
+        if not principal:
+            return _error(401, reason or "商户凭据无效")
+        order, session_token, error = merchant_api.create_merchant_intent(
+            db,
+            merchant,
+            str(body.get("externalOrderNo") or "").strip(),
+            str(body.get("externalUserRef") or "").strip(),
+            body.get("amountUnits"),
+            str(body.get("chain") or "").strip().upper(),
+            str(body.get("idempotencyKey") or "").strip() or None,
+        )
+        if error:
+            return _error(400, error)
+        policy.audit_sensitive(
+            db, principal, "create", "merchant:intent", f"order={order['order_no']}"
+        )
+        return _ok(
+            {
+                "orderNo": order["order_no"],
+                "merchant": order["merchant"],
+                "channel": order["channel"],
+                "amountUnits": order["amount_units"],
+                "receiveAddress": order["receive_address"],
+                "status": order["status"],
+                "expiredAt": order["expired_at"],
+                "sessionToken": session_token,
+            }
+        )
+    finally:
+        db.close()
+
+
+@router.get("/session/order")
+def resolve_session_order(
+    sessionToken: str = Query(default=""), orderNo: str = Query(default="")
+):
+    db = _db()
+    try:
+        order, error = merchant_api.resolve_pay_session(db, sessionToken, orderNo)
+        if error:
+            return _error(403, error)
+        return _ok(
+            {
+                "orderNo": order["order_no"],
+                "merchant": order["merchant"],
+                "channel": order["channel"],
+                "amountUnits": order["amount_units"],
+                "receiveAddress": order["receive_address"],
+                "status": order["status"],
+                "expiredAt": order["expired_at"],
+            }
+        )
     finally:
         db.close()
 

@@ -19,7 +19,7 @@
 | T0 | PASS | `evidence/split-v1/t0-gate.txt`：独立环境依赖导入通过；pytest 1/1；Gold 8912 未启动时真实 8061 `/health`=200 |
 | T1 | PASS | `evidence/split-v1/t1-gate.txt`：完整 14 文件迁移；AST 函数签名等价；pytest 3/3；冷库基础表 10/10；禁词仅兼容常量层 1 处 |
 | T2 | PASS | `evidence/split-v1/t2-gate.txt`：pytest 8/8；OpenAPI 17 条 `/api/pay/*`；Gold 停机时真实冷启动/订单/查询/二维码/鉴权全绿；循环心跳可见；Gold 原支付路由与循环零命中 |
-| T3 | 未开始 | — |
+| T3 | PASS | `evidence/split-v1/t3-gate.txt`：pytest 11/11；独立冷库首次迁移 `[9]`、重跑 `[]`；m009 字段/索引原样；会话单订单隔离 200/403；Gold m009 所有权零残留 |
 | T4 | 未开始 | — |
 | T5 | 未开始 | — |
 | Tn | 未开始 | — |

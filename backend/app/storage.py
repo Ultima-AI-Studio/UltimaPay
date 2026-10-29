@@ -5,30 +5,20 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import unquote, urlparse
 
-from . import config
 from .catalog import SUBSCRIPTION_PLANS
 
 
 def database_path() -> Path:
-    parsed = urlparse(config.database_url())
-    if parsed.scheme != "sqlite":
-        raise ValueError("T1 bootstrap supports only sqlite URLs")
-    raw = unquote(parsed.path)
-    if parsed.netloc:
-        raw = f"//{parsed.netloc}{raw}"
-    if raw.startswith("/") and len(raw) > 2 and raw[2] == ":":
-        raw = raw[1:]
-    return Path(raw).resolve()
+    from .db import database_path as authoritative_database_path
+
+    return authoritative_database_path()
 
 
 def open_connection() -> sqlite3.Connection:
-    path = database_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(path, timeout=10, check_same_thread=False)
-    db.row_factory = sqlite3.Row
-    return db
+    from .db import connection
+
+    return connection()
 
 
 def ensure_payment_base_schema(db: sqlite3.Connection) -> None:
