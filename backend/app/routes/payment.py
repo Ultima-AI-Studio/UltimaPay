@@ -414,7 +414,11 @@ def create_order(
     try:
         user = db.execute("SELECT username FROM users WHERE username=?", (principal["username"],)).fetchone()
         if not user:
-            return _error(401, "用户不存在")
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            db.execute(
+                "INSERT INTO users(user_id,username,email,status,created_at) VALUES(?,?,?,?,?)",
+                (principal["username"], principal["username"], "", "active", now),
+            )
         merchant = "ultima-gold"
         if x_pay_key:
             row = db.execute(
@@ -441,6 +445,25 @@ def create_order(
                     "createdAt": item["createdAt"], "expiredAt": item["expiredAt"],
                     "address": item["receiveAddress"] or channel.get("address") or cfg["address"],
                     "ttlMinutes": cfg["ttlMinutes"]})
+    finally:
+        db.close()
+
+
+@router.get("/user/orders")
+def get_user_orders(
+    x_pay_user: str | None = Header(default=None),
+    x_pay_signature: str | None = Header(default=None),
+):
+    principal, reason = policy.user_principal(x_pay_user or "", x_pay_signature or "")
+    if not principal:
+        return _error(401, reason)
+    db = _db()
+    try:
+        rows = db.execute(
+            "SELECT * FROM payment_orders WHERE username=? ORDER BY id DESC LIMIT 50",
+            (principal["username"],),
+        ).fetchall()
+        return _ok({"list": [payments.payment_row(row) for row in rows]})
     finally:
         db.close()
 

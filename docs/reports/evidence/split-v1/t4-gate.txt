@@ -1,0 +1,51 @@
+Gate T4 — UltimaGold payment ownership detached
+Date: 2026-10-29 (Asia/Shanghai)
+
+1. Frozen prerequisites
+   - T0 tag -> e1356691f0c31ad8a64e84b66a3c7ab171e56108
+   - T1 tag -> a5607376f8ccfd9828874e9f19d1ffaf679e7d35
+   - T2 tag -> 8fa3c27da697ae629771ee836d8942ffab969cc4
+   - T3 tag -> d9924646a2e599f92ebf3d324e86f0e3fd4878b6
+
+2. Gold core boundary
+   - Gold payment package directory: absent
+   - feed_server.py payment route, payment loop, payment schema and channel constants: zero live-source matches
+   - Gold db.py payment-session migration owner: zero matches
+   - live website retired payment path: zero matches; standalone service override and /api/pay/* callers present
+   - read-only reconciliation CLI owner: UltimaPay backend/scripts/reconcile.py
+
+3. Reversible evidence
+   - gold-core-forward.patch checked with `git apply --check --reverse`: exit 0
+   - gold-core-reverse.patch checked with `git apply --check`: exit 0
+   - Gold has no Git repository; the two patches are the recovery evidence required by the work order.
+
+4. Automated verification
+   - `python -m pytest tests/test_t4_gold_detached.py -q`: 4 passed in 1.04s
+   - Gold current Python sources compiled in memory: 243 files, exit 0
+   - `from ultima_backend.membership import fulfillment`: import PASS
+   - `pytest tests/ultima_gold/test_ugp27.py tests/ultima_gold/test_ugp28.py -q`: 6 passed in 0.40s
+   - Existing warning: news-feed/_test_top.py has an invalid escape sequence; no failure and not changed by this work order.
+
+5. Real detached-process smoke
+   - Gold port 8912 listeners before start: 0
+   - UltimaPay port 8061 listeners before start: 0
+   - Started only backend/run.py; health HTTP 200; channels HTTP 200; signed user order create HTTP 200; order query HTTP 200 pending; QR HTTP 200 image/png (458 bytes)
+   - Payment loop heartbeat: livePolling=False, expired=0, settled=0
+   - Stopped the exact spawned service; port 8061 listeners after stop: 0
+
+6. Post-edit SHA-256
+   - feed_server.py: 18F1DB277E870EAB32AC63F7F803B57216DE7066767E8FEE91B9B5B255F53491
+   - Gold db.py: 6638DC489BF8BC06DFDEE2360ED18905067C8C7B2BED324647FF5EBE74CAC02E
+   - membership/fulfillment.py: 79E28860A69E3305790EF737A74902AA992061CEB558414A672821F32362E0BB
+   - membership/payment_events.py: 6691AB34E2509CBF8FDB7F371682F81754A728F84437E9667570131FC49DFEE0
+   - API registry: 302C4D2E80EB587CFDB13BCC94C3A74F96274DBD39A1E8E88FB54202BF5136B0
+   - auth policy: 0F3B0F53CBF753DE70DBDDA92DD6832C188F6C114C0B2FDD187E4418F405B775
+   - live website: 79B16F1AC59C294DB4B2C1D23D922EA6AC51A78EC940CC57DDFFA8D7B6F0CA1D
+   - UltimaPay reconcile.py: BB5CD8D4218C411ED2BEA9061CDFC09CE01A9EB3CFB16B978606282E40CDB401
+
+7. Temporary-state cleanup
+   - External Gold baseline copies removed after reversible patches were verified.
+   - Real-smoke temporary SQLite database removed.
+   - No temporary file was added to either product tree.
+
+Gate T4: PASS

@@ -31,3 +31,11 @@ def user_auth_secret() -> str:
 def admin_token() -> str:
     return os.getenv("ULTIMAPAY_ADMIN_TOKEN", "")
 
+
+def cors_origins() -> list[str]:
+    configured = os.getenv(
+        "ULTIMAPAY_CORS_ORIGINS",
+        "http://127.0.0.1:8912,http://localhost:8912",
+    )
+    return [origin.strip() for origin in configured.split(",") if origin.strip()]
+

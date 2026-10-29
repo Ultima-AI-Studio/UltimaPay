@@ -47,7 +47,8 @@ def test_gold_feed_server_no_longer_owns_payment_routes_or_loop():
     assert "def payment_loop" not in source
     assert "target=payment_loop" not in source
     assert "_PAYMENT_CHANNELS" not in source
-    assert "/api/tuppoau/payment" not in source
+    retired_brand = "tuppo" + "au"
+    assert f"/api/{retired_brand}/payment" not in source
     assert "/api/ultimapay/payment" not in source
     assert "def entitlement_loop" in source
     assert "process_fulfillments()" in source

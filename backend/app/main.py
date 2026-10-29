@@ -5,8 +5,9 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
-from . import db as database
+from . import config, db as database
 from .routes.payment import router as payment_router
 from .services.payment_loop import payment_loop
 
@@ -26,6 +27,20 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="UltimaPay API", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=config.cors_origins(),
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=[
+        "Authorization",
+        "Content-Type",
+        "X-Pay-Key",
+        "X-Pay-Secret",
+        "X-Pay-Signature",
+        "X-Pay-User",
+    ],
+)
 app.include_router(payment_router)
 
 

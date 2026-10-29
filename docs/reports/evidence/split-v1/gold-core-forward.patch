@@ -1,0 +1,3341 @@
+# UltimaGold core forward patch: pre-split -> detached
+diff --git a/news-feed/feed_server.py b/news-feed/feed_server.py
+index 45320c8..fe6b23c 100644
+--- a/news-feed/feed_server.py
++++ b/news-feed/feed_server.py
+@@ -24,17 +24,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+ from datetime import datetime, timedelta
+ from email.utils import parsedate_to_datetime
+ 
+-try:
+-    import qrcode  # 收款二维码生成（pip install qrcode）
+-    _QR_OK = True
+-except Exception:
+-    _QR_OK = False
+-
+ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ # ── 可注入配置：环境变量优先（UGP-02：测试入口隔离，默认值不变）──
+ DB_PATH = os.environ.get('UG_DB_PATH', os.path.join(BASE_DIR, 'news.db'))
+ PORT = int(os.environ.get('UG_PORT', '8912'))
+ FETCH_INTERVAL = 60  # 秒（新浪 1 分钟；FXStreet 每 5 轮 = 5 分钟）
++ULTIMAPAY_BASE_URL = os.environ.get('ULTIMAPAY_BASE_URL', 'http://127.0.0.1:8061').rstrip('/')
++ULTIMAPAY_USER_AUTH_SECRET = os.environ.get('ULTIMAPAY_USER_AUTH_SECRET', '')
+ LLM_MODEL = os.environ.get('UG_LLM_MODEL', 'qwen2.5:14b')
+ LLM_URL = os.environ.get('UG_LLM_URL', 'http://127.0.0.1:11434/api/generate')
+ PIPELINE_BATCH = 5  # 每轮 AI 流水线最多处理条数（串行，避免拖垮轮询）
+@@ -137,10 +133,6 @@ STATUS_FETCH = {'new': 0, 'dup': 0, 'skip': 0}
+ 
+ LOG_PATH = os.environ.get('UG_LOG_PATH', os.path.join(BASE_DIR, 'feed.log'))
+ 
+-# UGP-03 止血：真实收款与自动推进默认关闭。UGP_LIVE_PAYMENT=1 才允许查链记录，
+-# 但链上深度/连续确认门（onchain 核验流程）实现前，任何路径都不会自动写 confirmed。
+-UGP_LIVE_PAYMENT = os.environ.get('UGP_LIVE_PAYMENT', '0') == '1'
+-
+ 
+ def log(msg):
+     line = '[%s] %s' % (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), msg)
+@@ -205,7 +197,6 @@ if _BACKEND_DIR not in _sys.path:
+     _sys.path.insert(0, _BACKEND_DIR)
+ import ultima_backend.auth as auth
+ import ultima_backend.membership as membership
+-import ultima_backend.payments as payments
+ import ultima_backend.market as market
+ import ultima_backend.content as content
+ import ultima_backend.push as push
+@@ -373,48 +364,6 @@ def init_db():
+         id INTEGER PRIMARY KEY AUTOINCREMENT,
+         inviter TEXT, invitee TEXT, plan_id TEXT, bonus_days INTEGER,
+         created_at TEXT, UNIQUE(inviter, invitee))''')
+-    # ── 加密货币支付订单（聚合支付：金额带随机尾数保证唯一，哈希确认；channel 记录支付链）──
+-    conn.execute('''CREATE TABLE IF NOT EXISTS payment_orders(
+-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+-        order_no TEXT UNIQUE,
+-        username TEXT, plan_id TEXT, plan_name TEXT,
+-        price_usdt REAL, discount REAL, amount_usdt REAL, tail REAL,
+-        status TEXT DEFAULT 'pending', tx_hash TEXT DEFAULT '',
+-        created_at TEXT, paid_at TEXT, expired_at TEXT,
+-        channel TEXT DEFAULT 'TRON')''')
+-    # 兼容升级：旧表补 channel 列（多链聚合预留）
+-    cols = [r[1] for r in conn.execute('PRAGMA table_info(payment_orders)').fetchall()]
+-    if 'channel' not in cols:
+-        conn.execute("ALTER TABLE payment_orders ADD COLUMN channel TEXT DEFAULT 'TRON'")
+-    # 兼容升级：补 merchant 列（订单归属接入方，Ultima Pay 按接入方查流水）
+-    if 'merchant' not in cols:
+-        conn.execute("ALTER TABLE payment_orders ADD COLUMN merchant TEXT DEFAULT ''")
+-    # 兼容升级：补 receive_address 列（订单实际收款地址：接入方自配优先，未配回退平台默认）
+-    if 'receive_address' not in cols:
+-        conn.execute("ALTER TABLE payment_orders ADD COLUMN receive_address TEXT DEFAULT ''")
+-    # 兼容升级：出站回调状态（订单确认后向接入方 callback_url 推送结果；success/failed/skipped）
+-    for _col, _ddl in [
+-        ('callback_status', "ALTER TABLE payment_orders ADD COLUMN callback_status TEXT DEFAULT ''"),
+-        ('callback_at', "ALTER TABLE payment_orders ADD COLUMN callback_at TEXT DEFAULT ''"),
+-        ('callback_attempts', "ALTER TABLE payment_orders ADD COLUMN callback_attempts INTEGER DEFAULT 0"),
+-    ]:
+-        if _col not in cols:
+-            conn.execute(_ddl)
+-            cols.append(_col)
+-    # 存量订单归属官方站（Ultima Gold 官网产生的支付记录）
+-    conn.execute("UPDATE payment_orders SET merchant='ultima-gold' WHERE merchant=''")
+-    conn.execute('CREATE INDEX IF NOT EXISTS idx_payment_status ON payment_orders(status)')
+-    conn.execute('CREATE INDEX IF NOT EXISTS idx_payment_merchant ON payment_orders(merchant)')
+-    # 支付通道配置（单行 id=1）：地址 / 启停 / 超时 / 官网回调密钥
+-    conn.execute('''CREATE TABLE IF NOT EXISTS payment_config(
+-        id INTEGER PRIMARY KEY CHECK (id=1),
+-        enabled INTEGER DEFAULT 1,
+-        address TEXT, ttl_minutes INTEGER DEFAULT 30,
+-        callback_secret TEXT DEFAULT '',
+-        updated_at TEXT)''')
+-    conn.execute('INSERT OR IGNORE INTO payment_config(id, enabled, address, ttl_minutes, callback_secret, updated_at)'
+-                 " VALUES(1, 1, ?, ?, '', ?)",
+-                 (PAYMENT_ADDRESS_DEFAULT, PAYMENT_TTL_DEFAULT, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+     # ── 订阅类型持久化（Ultima Gold / Agent 订阅管理：后台可编辑保存，DB 为权威；静态常量仅作 seed）──
+     conn.execute('''CREATE TABLE IF NOT EXISTS subscription_plans(
+         id TEXT PRIMARY KEY,
+@@ -453,73 +402,6 @@ def init_db():
+             conn.execute('ALTER TABLE %s ADD COLUMN %s' % (_tbl, _col))
+         except sqlite3.OperationalError:
+             pass
+-    # 多链收款地址配置（Ultima Pay）：每链一行，后台支付管理页可改，地址留空=该链未开通
+-    conn.execute('''CREATE TABLE IF NOT EXISTS payment_channel_config(
+-        channel TEXT PRIMARY KEY,
+-        address TEXT DEFAULT '',
+-        enabled INTEGER DEFAULT 1,
+-        updated_at TEXT DEFAULT '')''')
+-    _CHANNEL_SEED = [
+-        ('TRON', PAYMENT_ADDRESS_DEFAULT),
+-        ('ETH', '0x421565A03A43857BdcAB534FB8C8fD1C3158E06a'),
+-        ('BSC', '0x421565A03A43857BdcAB534FB8C8fD1C3158E06a'),
+-        ('SOL', ''),  # Solana 收款地址待配置（配置后该链开通）
+-    ]
+-    for _ch, _addr in _CHANNEL_SEED:
+-        conn.execute('INSERT OR IGNORE INTO payment_channel_config(channel, address, enabled, updated_at) VALUES(?,?,1,?)',
+-                     (_ch, _addr, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+-    # 工单管理（Ultima Pay）：接入方换址/其他诉求 → 客服工单；地址变更经工单执行后更新 merchant 并需重新下发 SDK
+-    conn.execute('''CREATE TABLE IF NOT EXISTS payment_tickets(
+-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+-        ticket_no TEXT DEFAULT '',
+-        merchant_code TEXT DEFAULT '',
+-        merchant_name TEXT DEFAULT '',
+-        contact_email TEXT DEFAULT '',
+-        type TEXT DEFAULT 'change_address',
+-        chain TEXT DEFAULT '',
+-        old_address TEXT DEFAULT '',
+-        new_address TEXT DEFAULT '',
+-        reason TEXT DEFAULT '',
+-        status TEXT DEFAULT 'open',
+-        remark TEXT DEFAULT '',
+-        created_at TEXT DEFAULT '',
+-        updated_at TEXT DEFAULT '')''')
+-    # 接入方管理（Ultima Pay）：谁接入了支付组件（产品/站点），回调地址与签名密钥
+-    # 自助申请链路：申请→自动入库(status=applied)→下发 api_key 接入包→SDK 首次调用校验(status=active)
+-    conn.execute('''CREATE TABLE IF NOT EXISTS payment_merchants(
+-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+-        code TEXT NOT NULL UNIQUE,
+-        name TEXT NOT NULL,
+-        email TEXT DEFAULT '',
+-        api_key TEXT DEFAULT '',
+-        status TEXT DEFAULT 'applied',
+-        apply_at TEXT DEFAULT '',
+-        last_seen_at TEXT DEFAULT '',
+-        callback_url TEXT DEFAULT '',
+-        secret TEXT DEFAULT '',
+-        enabled INTEGER DEFAULT 1,
+-        remark TEXT DEFAULT '',
+-        created_at TEXT DEFAULT '')''')
+-    # 兼容旧库：补缺失列
+-    _cols = [r[1] for r in conn.execute('PRAGMA table_info(payment_merchants)').fetchall()]
+-    for _col, _ddl in [('email', "TEXT DEFAULT ''"), ('api_key', "TEXT DEFAULT ''"),
+-                       ('status', "TEXT DEFAULT 'applied'"), ('apply_at', "TEXT DEFAULT ''"),
+-                       ('last_seen_at', "TEXT DEFAULT ''"),
+-                       ('hidden', 'INTEGER DEFAULT 0'),
+-                       ('tron_address', "TEXT DEFAULT ''"), ('eth_address', "TEXT DEFAULT ''"),
+-                       ('bsc_address', "TEXT DEFAULT ''"), ('sol_address', "TEXT DEFAULT ''")]:
+-        if _col not in _cols:
+-            conn.execute('ALTER TABLE payment_merchants ADD COLUMN %s %s' % (_col, _ddl))
+-    for _m in [
+-        ('ultima-gold', 'Ultima Gold 官方站点', 'ops@ultima.ai', 'upay_live_ultimagold00000000000001', 'active', '会员订阅加密支付（官网落地后接入）'),
+-        ('ultima-agent', 'Ultima Agent 官方站点', 'ops@ultima.ai', 'upay_live_ultimaagent0000000000002', 'active', '会员订阅加密支付（官网落地后接入）'),
+-        ('console', 'Ultima AI Console 后台', 'ops@ultima.ai', 'upay_live_console0000000000000003', 'active', '手动核销/测试下单'),
+-    ]:
+-        conn.execute('INSERT OR IGNORE INTO payment_merchants(code, name, email, api_key, status, remark, created_at) VALUES(?,?,?,?,?,?,?)',
+-                     (_m[0], _m[1], _m[2], _m[3], _m[4], _m[5], datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+-        # 旧库补齐：种子行若缺 email/api_key 或状态未初始化，则刷新为种子值
+-        conn.execute("UPDATE payment_merchants SET email=?, api_key=?, status=? WHERE code=? AND (email='' OR api_key='' OR status='applied' OR status='')",
+-                     (_m[2], _m[3], _m[4], _m[0]))
+     # 播报配置种子（演示用户，便于后台/APP 联调；接入真实用户系统后替换）
+     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+     # 种子：gold_hunter 持月卡（高级订阅）；gold_king/panda_trade 未订阅（标准套餐）
+@@ -692,310 +574,31 @@ def get_user_plan(user_key, product='tuppoau'):
+ 
+ 
+ 
+-# ── 加密货币支付通道（官方站点扫码支付：USDT TRC-20）──
+-# 对账防撞：实付金额 = 套餐价 + 随机一位小数尾数（如 198.3），每单金额唯一；
+-# 后台主动查链(TronGrid) + 官网推送回调(预留+密钥校验) + 页面手动核销(兜底) 三通道确认。
+-# 通道参数（地址/启停/超时/回调密钥）可配置：payment_config 单行表，后台通道卡可改。
+-PAYMENT_ADDRESS_DEFAULT = 'TFa8L4TXqVPzdEQ5LgNCeEGDVJAbX22dA6'  # TRON TRC-20 收款地址（用户确认）
+-PAYMENT_TTL_DEFAULT = 30       # 下单后 30 分钟未到账自动失效
+-PAYMENT_POLL_SECONDS = 30      # 主动查链轮询间隔
+-TRONGRID_URL = 'https://api.trongrid.io/v1/accounts/%s/transactions/trc20'
+-# 支付链适配器登记（Ultima Pay 多链聚合；每链：显示名/币种/收款地址/RPC 查询端点池）
+-# address 为空表示该链收款地址未配置（通道未开通，下单会明确拒绝）
+-# rpcUrl 为主查询端点，rpcBackup 为备选池（逗号分隔，主端点连不上时自动切换尝试）
+-_PAYMENT_CHANNELS = {
+-    'TRON': {'name': 'TRON', 'network': 'TRON TRC-20', 'currency': 'USDT',
+-             'address': PAYMENT_ADDRESS_DEFAULT, 'enabled': True,
+-             'rpcUrl': 'https://api.trongrid.io', 'rpcBackup': ''},
+-    'ETH': {'name': 'Ethereum', 'network': 'Ethereum ERC-20', 'currency': 'USDT',
+-            'address': '0x421565A03A43857BdcAB534FB8C8fD1C3158E06a', 'enabled': True,
+-            'rpcUrl': 'https://ethereum.publicnode.com',
+-            'rpcBackup': 'https://ethereum-rpc.publicnode.com,https://rpc.ankr.com/eth,https://eth.llamarpc.com'},
+-    'BSC': {'name': 'BSC', 'network': 'BSC BEP-20', 'currency': 'USDT',
+-            'address': '0x421565A03A43857BdcAB534FB8C8fD1C3158E06a', 'enabled': True,
+-            'rpcUrl': 'https://bsc-dataseed.bnbchain.org',
+-            'rpcBackup': 'https://bsc-dataseed.binance.org,https://rpc.ankr.com/bsc'},
+-    'SOL': {'name': 'Solana', 'network': 'Solana SPL · USDT', 'currency': 'USDT',
+-            'address': '', 'enabled': False,  # 地址待配置；DB payment_channel_config 覆盖
+-            'rpcUrl': 'https://solana-rpc.publicnode.com',
+-            'rpcBackup': 'https://api.mainnet-beta.solana.com,https://rpc.ankr.com/solana'},
+-}
+-
+-
+-def _rpc_list(ch):
+-    """该链查询端点池：[主端点] + 备选池（去空、去重）。"""
+-    c = _PAYMENT_CHANNELS.get(ch) or {}
+-    main = (c.get('rpcUrl') or '').strip()
+-    backup = [u.strip() for u in (c.get('rpcBackup') or '').split(',') if u.strip()]
+-    out = []
+-    for u in [main] + backup:
+-        if u and u not in out:
+-            out.append(u)
+-    return out
+-
+-
+-def load_payment_channels():
+-    """UGP-06 委托：payments.load_payment_channels（业务逻辑单份权威，见 backend/ultima_backend）。"""
+-    return payments.load_payment_channels(_db())
+-
+-
+-
+-# ── 统计增强：日快照 / AI 分析样本 / 推送回执（后台仪表盘真实口径）──
+-def snapshot_daily_stats(date_str=None):
+-    """UGP-06 委托：ops.snapshot_daily_stats（业务逻辑单份权威，见 backend/ultima_backend）。"""
+-    return ops.snapshot_daily_stats(_db(), date_str)
+-
+-
+-
+-def read_daily_stats(days=14):
+-    """UGP-06 委托：ops.read_daily_stats（业务逻辑单份权威，见 backend/ultima_backend）。"""
+-    return ops.read_daily_stats(_db(), days)
+-
+-
+-
+-def daily_stats_loop():
+-    """日快照线程：启动即补今日，之后每分钟检查跨天补当日快照。"""
+-    snapshot_daily_stats()
+-    last = datetime.now().strftime('%Y-%m-%d')
+-    while True:
+-        time.sleep(60)
+-        today = datetime.now().strftime('%Y-%m-%d')
+-        if today != last:
+-            snapshot_daily_stats()
+-            last = today
+-
+-
+-def log_analysis_attempt(ok, mode, err=''):
+-    """UGP-06 委托：ops.log_analysis_attempt（业务逻辑单份权威，见 backend/ultima_backend）。"""
+-    return ops.log_analysis_attempt(_db(), ok, mode, err)
+-
+-
+-
+-def read_analysis_fail_rate(sample=100):
+-    """UGP-06 委托：ops.read_analysis_fail_rate（业务逻辑单份权威，见 backend/ultima_backend）。"""
+-    return ops.read_analysis_fail_rate(_db(), sample)
+-
+-
+-
+-def read_push_deliver_rate():
+-    """UGP-06 委托：ops.read_push_deliver_rate（业务逻辑单份权威，见 backend/ultima_backend）。"""
+-    return ops.read_push_deliver_rate(_db())
+-
+-
+-
+-def read_payment_config():
+-    """UGP-06 委托：payments.read_payment_config（业务逻辑单份权威，见 backend/ultima_backend）。"""
+-    return payments.read_payment_config(_db())
+-
+-
+-
+-def save_payment_config(enabled, address, ttl_minutes, callback_secret=''):
+-    """UGP-06 委托：payments.save_payment_config（业务逻辑单份权威，见 backend/ultima_backend）。"""
+-    return payments.save_payment_config(_db(), enabled, address, ttl_minutes, callback_secret)
+-
+-
+-
+-def _payment_expire_at():
+-    """UGP-06 委托：payments.payment_expire_at（业务逻辑单份权威，见 backend/ultima_backend）。"""
+-    return payments.payment_expire_at(_db())
+-
+-
+-
+-def _plan_by_id(plan_id):
+-    """UGP-06 委托：payments.plan_by_id（业务逻辑单份权威，见 backend/ultima_backend）。"""
+-    return payments.plan_by_id(_db(), plan_id)
+-
+-
+-
+-def create_payment_order(username, plan_id, channel='TRON', merchant='ultima-gold'):
+-    """UGP-06 委托：payments.create_payment_order（业务逻辑单份权威，见 backend/ultima_backend）。"""
+-    return payments.create_payment_order(_db(), username, plan_id, channel, merchant)
+-
+-
+-
+-def _payment_row(r):
+-    """UGP-06 委托：payments.payment_row（业务逻辑单份权威，见 backend/ultima_backend）。"""
+-    return payments.payment_row(r)
+-
+-
+-
+-def read_payment_orders(status=None):
+-    """UGP-06 委托：payments.read_payment_orders（业务逻辑单份权威，见 backend/ultima_backend）。"""
+-    return payments.read_payment_orders(_db(), status)
+-
+-
+-
+-def read_merchant_orders(merchant, status=None):
+-    """UGP-06 委托：payments.read_merchant_orders（业务逻辑单份权威，见 backend/ultima_backend）。"""
+-    return payments.read_merchant_orders(_db(), merchant, status)
+-
+-
+-
+-def read_payment_order(order_no):
+-    """UGP-06 委托：payments.read_payment_order（业务逻辑单份权威，见 backend/ultima_backend）。"""
+-    return payments.read_payment_order(_db(), order_no)
+-
+-
+-
+-def confirm_payment_order(order_no, tx_hash, amount_usdt=None, source='receipt'):
+-    """UGP-06 委托：payments.confirm_payment_order（业务逻辑单份权威，见 backend/ultima_backend）。"""
+-    return payments.confirm_payment_order(_db(), order_no, tx_hash, amount_usdt, source)
+-
+-
+-
+-def conn_row(order_no):
+-    """UGP-06 委托：payments.conn_row（业务逻辑单份权威，见 backend/ultima_backend）。"""
+-    return payments.conn_row(_db(), order_no)
+-
+-
+-
+-def deliver_merchant_callback(order_no):
+-    """UGP-06 委托：payments.deliver_merchant_callback（业务逻辑单份权威，见 backend/ultima_backend）。"""
+-    return payments.deliver_merchant_callback(_db(), order_no)
+-
+-
+-
+-def retry_payment_callbacks():
+-    """UGP-06 委托：payments.retry_payment_callbacks（业务逻辑单份权威，见 backend/ultima_backend）。"""
+-    return payments.retry_payment_callbacks(_db())
+-
+-
+-
+-def expire_stale_orders():
+-    """UGP-06 委托：payments.expire_stale_orders（业务逻辑单份权威，见 backend/ultima_backend）。"""
+-    return payments.expire_stale_orders(_db())
+-
++# ── Gold 权益消费者（支付服务已迁至 UltimaPay）──
++ENTITLEMENT_POLL_SECONDS = 30
+ 
+ 
+ def process_fulfillments():
+-    """UGP-27 委托：membership.fulfillment.process_pending_fulfillments（付款→权益可恢复履约）。
+-    延迟导入避免 payments↔membership 包初始化环。"""
++    """消费已确认付款事件并应用 Gold 权益；业务规则仍由 membership 域持有。"""
+     from ultima_backend.membership import fulfillment
+     return fulfillment.process_pending_fulfillments(_db())
+ 
+ 
+-
+ def process_invite_rewards():
+-    """UGP-28 委托：membership.invites.process_pending_invite_rewards（事件驱动邀请奖励收口）。"""
++    """消费履约事件并应用邀请奖励；业务规则仍由 membership 域持有。"""
+     from ultima_backend.membership import invites
+     return invites.process_pending_invite_rewards(_db())
+ 
+ 
+-
+-def fetch_trc20_incoming(address):
+-    """UGP-06 委托：payments.fetch_trc20_incoming（业务逻辑单份权威，见 backend/ultima_backend）。"""
+-    return payments.fetch_trc20_incoming(_db(), address)
+-
+-
+-
+-SOLANA_RPC_DEFAULT = 'https://api.mainnet-beta.solana.com'  # 公共 RPC 可配置（正式运营建议境外/付费端点）
+-USDT_SPL_MINT = 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB'  # Solana 主网 USDT SPL-token
+-
+-# EVM 链 USDT 合约与精度：ETH ERC-20 USDT decimals=6；BSC BEP-20 USDT decimals=18
+-EVM_USDT = {
+-    'ETH': ('0xdAC17F958D2ee523a2206206994597C13D831ec7', 6),
+-    'BSC': ('0x55d398326f99059fF775485246999027B3197955', 18),
+-}
+-TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
+-
+-
+-def _evm_rpc_call(chain, method, params):
+-    """UGP-06 委托：payments.evm_rpc_call（业务逻辑单份权威，见 backend/ultima_backend）。"""
+-    return payments.evm_rpc_call(_db(), chain, method, params)
+-
+-
+-
+-def fetch_evm_incoming(address, chain='ETH'):
+-    """UGP-06 委托：payments.fetch_evm_incoming（业务逻辑单份权威，见 backend/ultima_backend）。"""
+-    return payments.fetch_evm_incoming(_db(), address, chain)
+-
+-
+-
+-def _solana_rpc(method, params):
+-    """UGP-06 委托：payments.solana_rpc（业务逻辑单份权威，见 backend/ultima_backend）。"""
+-    return payments.solana_rpc(_db(), method, params)
+-
+-
+-
+-def fetch_solana_incoming(address):
+-    """UGP-06 委托：payments.fetch_solana_incoming（业务逻辑单份权威，见 backend/ultima_backend）。"""
+-    return payments.fetch_solana_incoming(_db(), address)
+-
+-
+-
+-def poll_and_settle():
+-    """每轮：按待支付订单的收款地址分组查链 → 金额匹配 → 记录回执（等待核验）。
+-    双轨支持：接入方自配地址的订单查接入方地址，未配的查平台默认地址。
+-    网络不通仅记日志，不中断。
+-    UGP-03：UGP_LIVE_PAYMENT=0（默认）时不查链、无自动推进；
+-    即使 live=1，查链结果也只走 confirm(source='poll') → submitted（等待核验），
+-    链上深度/连续确认门实现前不会自动 confirmed。"""
+-    if not UGP_LIVE_PAYMENT:
+-        return 0
+-    cfg = read_payment_config()
+-    if not cfg['enabled']:
+-        return 0
+-    conn = sqlite3.connect(DB_PATH)
+-    pendings = conn.execute(
+-        "SELECT order_no, receive_address, amount_usdt, channel FROM payment_orders WHERE status='pending'").fetchall()
+-    conn.close()
+-    if not pendings:
+-        return 0
+-    by_addr = {}
+-    for order_no, addr, amt, channel in pendings:
+-        by_addr.setdefault((addr or cfg['address'], channel or 'TRON'), []).append((order_no, amt))
+-    settled = 0
+-    for (addr, channel), items in by_addr.items():
+-        # 按链分派查链适配器：TRON → TronGrid TRC-20；SOL → Solana RPC SPL-token；ETH/BSC → EVM eth_getLogs USDT
+-        if channel == 'SOL':
+-            incoming = fetch_solana_incoming(addr)
+-        elif channel in ('ETH', 'BSC'):
+-            incoming = fetch_evm_incoming(addr, channel)
+-        else:
+-            incoming = fetch_trc20_incoming(addr)
+-        if not incoming:
+-            continue
+-        conn = sqlite3.connect(DB_PATH)
+-        for tx in incoming:
+-            row = conn.execute(
+-                "SELECT * FROM payment_orders WHERE status='pending' AND receive_address=? AND abs(amount_usdt-?)<0.005",
+-                (addr, tx['amount'])).fetchone()
+-            if row:
+-                conn.close()
+-                _, err = confirm_payment_order(row[1], tx['hash'], tx['amount'], source='poll')
+-                if err:
+-                    log('自动确认失败 %s: %s' % (row[1], err))
+-                else:
+-                    settled += 1
+-                    log('支付自动确认: %s %.2f USDT hash=%s addr=%s' % (row[1], tx['amount'], tx['hash'], addr))
+-                conn = sqlite3.connect(DB_PATH)
+-        conn.close()
+-    return settled
+-
+-
+-def payment_qrcode_png(text):
+-    """生成二维码 PNG 字节（内容自定义，默认收款地址协议串）。"""
+-    if not _QR_OK:
+-        return None
+-    img = qrcode.make(text)
+-    import io
+-    buf = io.BytesIO()
+-    img.save(buf, format='PNG')
+-    return buf.getvalue()
+-
+-
+-def payment_loop():
++def entitlement_loop():
++    """保留 Gold 非支付权益消费者，不承载支付轮询或支付 API。"""
+     while True:
+         try:
+-            expire_stale_orders()
+-            poll_and_settle()
+-            retry_payment_callbacks()
+             process_fulfillments()
+             process_invite_rewards()
+-        except Exception as e:
+-            log('支付轮询异常: %s' % e)
+-        time.sleep(PAYMENT_POLL_SECONDS)
+-
++        except Exception as exc:
++            log('权益轮询异常: %s' % exc)
++        time.sleep(ENTITLEMENT_POLL_SECONDS)
+ 
+ def read_platform_users():
+     """UGP-06 委托：ops.read_platform_users（业务逻辑单份权威，见 backend/ultima_backend）。"""
+@@ -2368,13 +1971,30 @@ def resolve_user_by_token(token):
+ 
+ def auth_register(body):
+     """UGP-06 委托：auth.register（业务逻辑单份权威，见 backend/ultima_backend）。"""
+-    return auth.register(_db(), body)
++    return _attach_pay_identity(auth.register(_db(), body))
+ 
+ 
+ 
+ def auth_login(body):
+     """UGP-06 委托：auth.login（业务逻辑单份权威，见 backend/ultima_backend）。"""
+-    return auth.login(_db(), body)
++    return _attach_pay_identity(auth.login(_db(), body))
++
++
++def _attach_pay_identity(result):
++    """Attach a username-scoped Pay assertion without exposing the shared secret."""
++    status, response = result
++    if status != 200 or not ULTIMAPAY_USER_AUTH_SECRET or not isinstance(response, dict):
++        return result
++    data = response.get('data') or {}
++    user = data.get('user') or {}
++    username = user.get('username') or ''
++    if username:
++        user['paySignature'] = hmac.new(
++            ULTIMAPAY_USER_AUTH_SECRET.encode('utf-8'),
++            username.encode('utf-8'),
++            hashlib.sha256,
++        ).hexdigest()
++    return status, response
+ 
+ 
+ 
+@@ -2421,11 +2041,6 @@ ADMIN_ONLY_POST_PREFIXES = (
+     '/api/agent/subscribe',
+     '/api/tuppoau/trial-config',
+     '/api/tuppoau/invite/grant',
+-    '/api/tuppoau/payment/channels',
+-    '/api/tuppoau/payment/merchants',
+-    '/api/tuppoau/payment/config',
+-    '/api/tuppoau/payment/expire',
+-    '/api/tuppoau/payment/tickets/process',
+     '/api/tuppoau/system/gaps/resolve',
+     '/api/tuppoau/system/gaps',
+     '/api/platform/stats',
+@@ -2446,30 +2061,22 @@ ADMIN_ONLY_POST_PREFIXES = (
+ 
+ # ── UltimaAdmin 拆分（2026-10-27）：已迁管理路径 → 独立后台 http://127.0.0.1:8913 ──
+ # GET 301（整路径或子路径命中即迁移）；POST 307（保方法语义，避免 301 降级为 GET）。
+-# 业务/交集接口（/api/ticker、/api/tuppoau/news、/api/tuppoau/user、/api/tuppoau/payment/qrcode、
+-# /api/tuppoau/subscription-plans GET、/api/tuppoau/payment/channels GET、payment/order|confirm 等）不在此列。
++# 支付接口已迁至独立 UltimaPay 服务（本地默认 http://127.0.0.1:8061/api/pay/）。
+ _ADMIN_MOVED_GET = (
+     '/', '/login', '/pricing', '/assets',
+     '/admin', '/api/platform', '/api/agent', '/api/user/info',
+     '/api/tuppoau/stats', '/api/tuppoau/analysis', '/api/tuppoau/bindings',
+     '/api/tuppoau/monitor', '/api/tuppoau/pushes', '/api/tuppoau/push/config',
+-    '/api/tuppoau/news/top', '/api/tuppoau/system/gaps', '/api/tuppoau/payments',
+-    '/api/tuppoau/payment/merchants', '/api/tuppoau/payment/merchant-orders',
+-    '/api/tuppoau/payment/tickets', '/api/tuppoau/trial-config',
+-    '/api/tuppoau/bell/config', '/api/tuppoau/payment/expire', '/api/tuppoau/payment/apply',
+-    '/api/tuppoau/payment/create',
++    '/api/tuppoau/news/top', '/api/tuppoau/system/gaps', '/api/tuppoau/trial-config',
++    '/api/tuppoau/bell/config',
+ )
+ _ADMIN_MOVED_POST = (
+     '/', '/login', '/pricing', '/assets',
+     '/admin', '/api/platform', '/api/agent', '/api/user/info',
+     '/api/tuppoau/stats', '/api/tuppoau/analysis', '/api/tuppoau/bindings',
+     '/api/tuppoau/monitor', '/api/tuppoau/pushes', '/api/tuppoau/push/config',
+-    '/api/tuppoau/news/top', '/api/tuppoau/system/gaps', '/api/tuppoau/payments',
+-    '/api/tuppoau/payment/merchants', '/api/tuppoau/payment/merchant-orders',
+-    '/api/tuppoau/payment/tickets', '/api/tuppoau/trial-config',
+-    '/api/tuppoau/bell/config', '/api/tuppoau/payment/config', '/api/tuppoau/payment/expire',
+-    '/api/tuppoau/payment/apply', '/api/tuppoau/payment/create',
+-    '/api/tuppoau/subscription-plans', '/api/tuppoau/payment/channels', '/api/tuppoau/invite/grant',
++    '/api/tuppoau/news/top', '/api/tuppoau/system/gaps', '/api/tuppoau/trial-config',
++    '/api/tuppoau/bell/config', '/api/tuppoau/subscription-plans', '/api/tuppoau/invite/grant',
+ )
+ 
+ 
+@@ -2538,13 +2145,6 @@ class Handler(BaseHTTPRequestHandler):
+         self.send_header('Content-Length', '0')
+         self.end_headers()
+ 
+-    def _normalize_payment_alias(self):
+-        """P0-01：把对外新支付前缀 /api/ultimapay/payment/* 归一为既有处理分支 /api/tuppoau/payment/*。
+-        新前缀为正式对外路径；旧 /api/tuppoau/payment/* 为过渡兼容别名（前端未切换期间保持可用）。
+-        归一发生在所有分支路由与写路由鉴权门之前，故新旧路径走完全相同的处理与鉴权。"""
+-        if self.path.startswith('/api/ultimapay/payment/'):
+-            self.path = '/api/tuppoau/payment/' + self.path[len('/api/ultimapay/payment/'):]
+-
+     def _admin_token_from_request(self):
+         """P0 X-03：管理令牌双来源——优先 Authorization: Bearer <token>，其次 Cookie ug_token。"""
+         raw = self.headers.get('Authorization') or ''
+@@ -2570,9 +2170,6 @@ class Handler(BaseHTTPRequestHandler):
+     def do_GET(self):
+         if not self._begin():
+             return
+-        # P0-01：支付接口对外新路径 /api/ultimapay/payment/* —— 内部归一到既有 /api/tuppoau/payment/* 处理分支（同处理）。
+-        # /api/tuppoau/payment/* 为「过渡兼容别名，待退役」：旧后台前端仍调用，归一后两条路径行为完全一致。
+-        self._normalize_payment_alias()
+         # ── UltimaAdmin 拆分：已迁管理路径 301 → http://127.0.0.1:8913<原路径>（不再返回后台数据）──
+         if self._moved_admin_path():
+             self._redirect_admin(301)
+@@ -2749,174 +2346,6 @@ class Handler(BaseHTTPRequestHandler):
+                 self._send(404, {'code': 404, 'message': 'user not found'})
+                 return
+             self._send(200, {'code': 0, 'data': invite_profile(row[0])})
+-        elif self.path.startswith('/api/tuppoau/payment/qrcode'):
+-            # 收款二维码（PNG）：默认 tron:地址；支持 ?text= 自定义（如 tron:地址?amount=458.3 精确转账）
+-            cfg = read_payment_config()
+-            qs = self.path.split('?', 1)
+-            text = ''
+-            if len(qs) > 1:
+-                for kv in qs[1].split('&'):
+-                    if kv.startswith('text='):
+-                        text = urllib.parse.unquote(kv[5:])
+-            png = payment_qrcode_png(text or ('tron:' + cfg['address']))
+-            if not png:
+-                self._send(500, {'code': 500, 'message': '二维码库未安装（pip install qrcode）'})
+-                return
+-            self.send_response(200)
+-            self.send_header('Content-Type', 'image/png')
+-            self.send_header('Access-Control-Allow-Origin', '*')
+-            self.send_header('Content-Length', str(len(png)))
+-            self.end_headers()
+-            self.wfile.write(png)
+-        elif self.path.startswith('/api/tuppoau/my-orders'):
+-            # 官网个人中心（UGP-24）：仅可信会话，订单归属以会话用户为准，不再信任 ?user=
+-            _su = self._session_user()
+-            if not _su:
+-                self._send(401, {'code': 401, 'message': '请先登录'})
+-                return
+-            _uname = _su.get('username') or _su.get('user') or ''
+-            if not _uname:
+-                self._send(400, {'code': 400, 'message': '缺少用户会话'})
+-                return
+-            _c = sqlite3.connect(DB_PATH)
+-            _rows = _c.execute('SELECT order_no, plan_name, amount_usdt, channel, status, created_at, paid_at'
+-                               ' FROM payment_orders WHERE username=? AND merchant=? ORDER BY id DESC LIMIT 50',
+-                               (_uname, 'ultima-gold')).fetchall()
+-            _c.close()
+-            self._send(200, {'code': 0, 'data': {
+-                'orders': [{'orderNo': r[0], 'planName': r[1], 'amountUsdt': r[2], 'channel': r[3],
+-                            'status': r[4], 'createdAt': r[5], 'paidAt': r[6]} for r in _rows],
+-            }})
+-        elif self.path.startswith('/api/tuppoau/payment/order'):
+-            # 订单状态查询（前端支付窗口轮询）：?orderNo=xxx
+-            qs = self.path.split('?', 1)
+-            order_no = ''
+-            if len(qs) > 1:
+-                for kv in qs[1].split('&'):
+-                    if kv.startswith('orderNo='):
+-                        order_no = kv[8:]
+-            if not order_no:
+-                self._send(400, {'code': 400, 'message': '缺少 orderNo'})
+-                return
+-            row = read_payment_order(order_no)
+-            if not row:
+-                self._send(404, {'code': 404, 'message': '订单不存在'})
+-                return
+-            self._send(200, {'code': 0, 'data': row})
+-        elif self.path.startswith('/api/tuppoau/payment/channels'):
+-            # 多链支付通道配置（前台 PayWindow 通道探测 / 后台支付管理页读写共用）
+-            chs = load_payment_channels()
+-            self._send(200, {'code': 0, 'data': {
+-                'channels': [{'key': k, 'name': v['name'], 'network': v['network'],
+-                              'currency': v['currency'], 'address': v.get('address', ''),
+-                              'rpcUrl': v.get('rpcUrl', ''), 'rpcBackup': v.get('rpcBackup', ''),
+-                              'enabled': v.get('enabled', True)}
+-                             for k, v in chs.items()],
+-            }})
+-        elif self.path.startswith('/api/tuppoau/payment/merchant-orders'):
+-            # 接入方「查看」抽屉数据：该接入方名下收款侧支付流水 + 汇总统计
+-            # UGP-10 归属鉴权：管理员令牌（后台 axios 拦截器自动携带）或商户 api_key（接入方 SDK）
+-            # 可信会话/凭据解析角色，不信任正文 merchant 参数本身 → 阻断横向越权（无凭据一律拒绝）
+-            qs = self.path.split('?', 1)
+-            merchant = ''
+-            status = 'all'
+-            api_key = ''
+-            if len(qs) > 1:
+-                for kv in qs[1].split('&'):
+-                    if kv.startswith('merchant='):
+-                        merchant = kv[9:]
+-                    elif kv.startswith('status='):
+-                        status = kv[7:]
+-                    elif kv.startswith('api_key='):
+-                        api_key = kv[8:]
+-            if not merchant:
+-                self._send(400, {'code': 400, 'message': '缺少 merchant 参数'})
+-                return
+-            principal = None
+-            reason = ''
+-            # 管理员会话优先（后台读抽屉）
+-            _hdr = self.headers.get('Authorization', '') or ''
+-            _tok = _hdr[7:] if _hdr.startswith('Bearer ') else ''
+-            _q_tok = ''
+-            if len(qs) > 1:
+-                for kv in qs[1].split('&'):
+-                    if kv.startswith('token='):
+-                        _q_tok = kv[6:]
+-            admin_p = policy.principal_from_session(_db(), _tok or _q_tok)
+-            if admin_p and admin_p.get('role') == 'admin':
+-                principal = admin_p
+-            else:
+-                principal, reason = policy.merchant_principal(_db(), merchant, api_key)
+-            if not principal:
+-                self._send(401, {'code': 401, 'message': reason or '未授权：请携带管理员会话或商户凭据'})
+-                return
+-            # 商户本人仅可读自己名下流水（横向越权阻断）；管理员读走 order:read
+-            if principal.get('role') == 'merchant':
+-                ok, rr = policy.authorize_object(principal, 'read_own', 'merchant', merchant)
+-                if not ok:
+-                    self._send(403, {'code': 403, 'message': rr})
+-                    return
+-            orders, stats = read_merchant_orders(merchant, status)
+-            policy.audit_sensitive(_db(), principal, 'read', 'merchant:orders', detail='merchant=%s status=%s' % (merchant, status))
+-            self._send(200, {'code': 0, 'data': {'list': orders, 'stats': stats}})
+-        elif self.path.startswith('/api/tuppoau/payment/tickets'):
+-            # 工单列表（后台）：可按状态过滤（open/processing/done/rejected）
+-            qs = self.path.split('?', 1)
+-            status = ''
+-            if len(qs) > 1:
+-                for kv in qs[1].split('&'):
+-                    if kv.startswith('status='):
+-                        status = kv[7:]
+-            conn = sqlite3.connect(DB_PATH)
+-            sql = "SELECT id, ticket_no, merchant_code, merchant_name, contact_email, type, chain, old_address, new_address, reason, status, remark, created_at, updated_at FROM payment_tickets"
+-            args = []
+-            if status:
+-                sql += " WHERE status=?"
+-                args.append(status)
+-            sql += " ORDER BY id DESC"
+-            rows = conn.execute(sql, args).fetchall()
+-            conn.close()
+-            self._send(200, {'code': 0, 'data': {
+-                'tickets': [{'id': r[0], 'ticketNo': r[1], 'merchantCode': r[2], 'merchantName': r[3],
+-                             'contactEmail': r[4], 'type': r[5], 'chain': r[6], 'oldAddress': r[7],
+-                             'newAddress': r[8], 'reason': r[9], 'status': r[10], 'remark': r[11],
+-                             'createdAt': r[12] or '', 'updatedAt': r[13] or ''}
+-                            for r in rows],
+-            }})
+-        elif self.path.startswith('/api/tuppoau/payment/merchants'):
+-            # 接入方管理（Ultima Pay）：列出已接入支付组件的需求方
+-            conn = sqlite3.connect(DB_PATH)
+-            rows = conn.execute(
+-                'SELECT id, code, name, email, api_key, status, apply_at, last_seen_at, callback_url, secret, enabled, remark, created_at, tron_address, eth_address, bsc_address, sol_address FROM payment_merchants WHERE COALESCE(hidden,0)=0 ORDER BY id').fetchall()
+-            conn.close()
+-            self._send(200, {'code': 0, 'data': {
+-                # UGP-03：普通响应不含敏感配置原值（apiKey/secret 不下发，需下发走后续受控通道）
+-                'merchants': [{'id': r[0], 'code': r[1], 'name': r[2], 'email': r[3],
+-                               'status': r[5], 'applyAt': r[6] or '', 'lastSeenAt': r[7] or '',
+-                               'callbackUrl': r[8], 'enabled': bool(r[10]),
+-                               'remark': r[11], 'createdAt': r[12],
+-                               'tronAddress': r[13] or '', 'ethAddress': r[14] or '', 'bscAddress': r[15] or '',
+-                               'solAddress': r[16] if len(r) > 16 else ''}
+-                              for r in rows],
+-            }})
+-        elif self.path.startswith('/api/tuppoau/payment/address'):
+-            cfg = read_payment_config()
+-            self._send(200, {'code': 0, 'data': {
+-                'address': cfg['address'],
+-                'network': 'TRON TRC-20',
+-                'currency': 'USDT',
+-                'enabled': cfg['enabled'],
+-                'ttlMinutes': cfg['ttlMinutes'],
+-                # UGP-03：callbackSecret 不下发到公共响应
+-            }})
+-        elif self.path.startswith('/api/tuppoau/payments'):
+-            qs = self.path.split('?', 1)
+-            status = 'all'
+-            if len(qs) > 1:
+-                for kv in qs[1].split('&'):
+-                    if kv.startswith('status='):
+-                        status = kv[7:]
+-            self._send(200, {'code': 0, 'data': {'list': read_payment_orders(status)}})
+         elif self.path.startswith('/api/tuppoau/system/gaps'):
+             # 系统检查清单；?status=all 时同时返回已处理项（Ultima Pay 待办页用）
+             qs = self.path.split('?', 1)[1] if '?' in self.path else ''
+@@ -2997,8 +2426,6 @@ class Handler(BaseHTTPRequestHandler):
+     def do_POST(self):
+         if not self._begin():
+             return
+-        # P0-01：支付新路径归一（与 do_GET 一致）
+-        self._normalize_payment_alias()
+         # ── UltimaAdmin 拆分：已迁管理写路径 307（保方法）→ http://127.0.0.1:8913<原路径> ──
+         if self._moved_admin_path(post=True):
+             self._redirect_admin(307)
+@@ -3269,390 +2696,6 @@ class Handler(BaseHTTPRequestHandler):
+                 return
+             result = bind_invite(row[0], payload.get('code') or '')
+             self._send(200, {'code': 0, 'data': result})
+-        elif self.path.startswith('/api/tuppoau/payment/channels'):
+-            # 多链支付通道配置保存（后台支付管理页调用；rpcUrl/rpcBackup 为各链查链查询端点池，address 保留系统兜底不在此维护）
+-            length = int(self.headers.get('Content-Length') or 0)
+-            try:
+-                payload = json.loads(self.rfile.read(length).decode('utf-8')) if length else {}
+-            except Exception:
+-                payload = {}
+-            items = payload.get('channels') or []
+-            if items:
+-                now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+-                conn = sqlite3.connect(DB_PATH)
+-                for it in items:
+-                    key = str(it.get('key') or '')
+-                    if key not in _PAYMENT_CHANNELS:
+-                        continue
+-                    # 只更新启停与 RPC 端点池；不覆盖既有收款地址（接入方自配/系统兜底地址不受此页影响）
+-                    conn.execute('INSERT INTO payment_channel_config(channel, address, enabled, rpc_url, rpc_backup, updated_at)'
+-                                 ' VALUES(?, (SELECT COALESCE(address,\'\') FROM payment_channel_config WHERE channel=?), ?, ?, ?, ?)'
+-                                 ' ON CONFLICT(channel) DO UPDATE SET enabled=excluded.enabled,'
+-                                 ' rpc_url=excluded.rpc_url, rpc_backup=excluded.rpc_backup, updated_at=excluded.updated_at',
+-                                 (key, key, 1 if it.get('enabled', True) else 0,
+-                                  str(it.get('rpcUrl') or '').strip(),
+-                                  str(it.get('rpcBackup') or '').strip(), now))
+-                conn.commit()
+-                conn.close()
+-            chs = load_payment_channels()
+-            self._send(200, {'code': 0, 'data': {
+-                'channels': [{'key': k, 'name': v['name'], 'network': v['network'],
+-                              'currency': v['currency'], 'address': v.get('address', ''),
+-                              'rpcUrl': v.get('rpcUrl', ''), 'rpcBackup': v.get('rpcBackup', ''),
+-                              'enabled': v.get('enabled', True)}
+-                             for k, v in chs.items()],
+-            }})
+-        elif self.path.startswith('/api/tuppoau/payment/merchants'):
+-            # 接入方管理（Ultima Pay）：新增/更新接入方（code 唯一，存在则更新）
+-            length = int(self.headers.get('Content-Length') or 0)
+-            try:
+-                payload = json.loads(self.rfile.read(length).decode('utf-8')) if length else {}
+-            except Exception:
+-                payload = {}
+-            code = str(payload.get('code') or '').strip()
+-            name = str(payload.get('name') or '').strip()
+-            if not code or not name:
+-                self._send(400, {'code': 400, 'message': 'code 与 name 必填'})
+-                return
+-            conn = sqlite3.connect(DB_PATH)
+-            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+-            # secret 键缺省（编辑留空）时保持原值；显式传入（含空串）则按传入更新
+-            if 'secret' in payload:
+-                secret = str(payload.get('secret') or '').strip()
+-            else:
+-                _srow = conn.execute('SELECT secret FROM payment_merchants WHERE code=?', (code,)).fetchone()
+-                secret = _srow[0] if _srow else ''
+-            # 运营后台手动录入视为已接入（active）；自助申请走 /apply 端点（applied）；编辑时保持原状态与原凭证
+-            _mrow = conn.execute('SELECT api_key, status, tron_address, eth_address, bsc_address, sol_address FROM payment_merchants WHERE code=?', (code,)).fetchone()
+-            email = str(payload.get('email') or '').strip()
+-            new_tron = str(payload.get('tronAddress') or '').strip()
+-            new_eth = str(payload.get('ethAddress') or '').strip()
+-            new_bsc = str(payload.get('bscAddress') or '').strip()
+-            new_sol = str(payload.get('solAddress') or '').strip()
+-            if _mrow:
+-                api_key = _mrow[0] or ('upay_live_' + secrets.token_hex(12))
+-                status = _mrow[1] or 'active'
+-                # 地址固化监管：已入库接入方的收款地址不可自助变更（防换址），变更必须走工单
+-                if ((_mrow[2] or '') != new_tron or (_mrow[3] or '') != new_eth
+-                        or (_mrow[4] or '') != new_bsc or (_mrow[5] or '') != new_sol):
+-                    conn.close()
+-                    self._send(400, {'code': 400, 'message': '收款地址已固化不可变更，如需换址请联系客服提交工单'})
+-                    return
+-            else:
+-                api_key = 'upay_live_' + secrets.token_hex(12)
+-                status = 'active'
+-            conn.execute(
+-                "INSERT INTO payment_merchants(code, name, email, api_key, status, callback_url, secret, enabled, remark, created_at, tron_address, eth_address, bsc_address, sol_address) "
+-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+-                "ON CONFLICT(code) DO UPDATE SET name=excluded.name, email=excluded.email, callback_url=excluded.callback_url, "
+-                "secret=excluded.secret, enabled=excluded.enabled, remark=excluded.remark",
+-                (code, name, email, api_key, status, str(payload.get('callbackUrl') or '').strip(),
+-                 secret,
+-                 1 if payload.get('enabled', True) else 0,
+-                 str(payload.get('remark') or '').strip(), now,
+-                 _mrow[2] if _mrow else new_tron,
+-                 _mrow[3] if _mrow else new_eth,
+-                 _mrow[4] if _mrow else new_bsc,
+-                 _mrow[5] if _mrow else new_sol))
+-            conn.commit()
+-            rows = conn.execute(
+-                'SELECT id, code, name, email, api_key, status, apply_at, last_seen_at, callback_url, secret, enabled, remark, created_at, tron_address, eth_address, bsc_address, sol_address FROM payment_merchants WHERE COALESCE(hidden,0)=0 ORDER BY id').fetchall()
+-            conn.close()
+-            self._send(200, {'code': 0, 'data': {
+-                # UGP-03：响应不含 apiKey/secret 原值（凭证下发走后续受控通道）
+-                'merchants': [{'id': r[0], 'code': r[1], 'name': r[2], 'email': r[3],
+-                               'status': r[5], 'applyAt': r[6] or '', 'lastSeenAt': r[7] or '',
+-                               'callbackUrl': r[8], 'enabled': bool(r[10]),
+-                               'remark': r[11], 'createdAt': r[12],
+-                               'tronAddress': r[13] or '', 'ethAddress': r[14] or '', 'bscAddress': r[15] or '',
+-                               'solAddress': r[16] if len(r) > 16 else ''}
+-                              for r in rows],
+-            }})
+-        elif self.path.startswith('/api/tuppoau/payment/apply'):
+-            # 接入方自助申请（公开，官网/站点表单调用）：自动入库 + 下发接入凭证（api_key）
+-            length = int(self.headers.get('Content-Length') or 0)
+-            try:
+-                payload = json.loads(self.rfile.read(length).decode('utf-8')) if length else {}
+-            except Exception:
+-                payload = {}
+-            code = str(payload.get('code') or '').strip().lower()
+-            name = str(payload.get('name') or '').strip()
+-            email = str(payload.get('email') or '').strip().lower()
+-            remark = str(payload.get('remark') or '').strip()
+-            if not code or not name or not email:
+-                self._send(400, {'code': 400, 'message': 'code、name、email 必填'})
+-                return
+-            if not re.match(r'^[\w.+-]+@[\w-]+(\.[\w-]+)+$', email):
+-                self._send(400, {'code': 400, 'message': '邮箱格式不正确'})
+-                return
+-            # 收款链路配置：勾选几条填几条（tronAddress/ethAddress/bscAddress 等），未配置的链视为不接入
+-            tron_addr = str(payload.get('tronAddress') or '').strip()
+-            eth_addr = str(payload.get('ethAddress') or '').strip()
+-            bsc_addr = str(payload.get('bscAddress') or '').strip()
+-            sol_addr = str(payload.get('solAddress') or '').strip()
+-            if not tron_addr and not eth_addr and not bsc_addr and not sol_addr:
+-                self._send(400, {'code': 400, 'message': '请至少配置一条收款链路地址（TRON/ETH/BSC/SOL 任选）'})
+-                return
+-            conn = sqlite3.connect(DB_PATH)
+-            if conn.execute('SELECT id FROM payment_merchants WHERE code=?', (code,)).fetchone():
+-                conn.close()
+-                self._send(400, {'code': 400, 'message': '该代号已被占用，请换一个'})
+-                return
+-            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+-            api_key = 'upay_live_' + secrets.token_hex(12)
+-            conn.execute(
+-                "INSERT INTO payment_merchants(code, name, email, api_key, status, apply_at, remark, created_at, tron_address, eth_address, bsc_address, sol_address) "
+-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+-                (code, name, email, api_key, 'applied', now, remark or '网站自助申请', now,
+-                 tron_addr, eth_addr, bsc_addr, sol_addr))
+-            conn.commit()
+-            row = conn.execute('SELECT id, code, name, email, api_key, status, apply_at FROM payment_merchants WHERE code=?',
+-                               (code,)).fetchone()
+-            conn.close()
+-            self._send(200, {'code': 0, 'data': {
+-                'id': row[0], 'code': row[1], 'name': row[2], 'email': row[3],
+-                # UGP-03：公开响应不下发 apiKey 原值，接入凭证经受控通道（邮件/SDK 包）下发
+-                'status': row[5], 'applyAt': row[6],
+-                'message': '申请成功，接入凭证已生成（SDK 接入包将发送至邮箱）',
+-            }})
+-        elif self.path.startswith('/api/tuppoau/payment/verify'):
+-            # SDK 接入校验（接入方首次调用/心跳，携带 X-Pay-Key）：校验通过标记为「已接入」
+-            api_key = str(self.headers.get('X-Pay-Key') or '').strip()
+-            length = int(self.headers.get('Content-Length') or 0)
+-            if not api_key:
+-                try:
+-                    payload = json.loads(self.rfile.read(length).decode('utf-8')) if length else {}
+-                    api_key = str(payload.get('apiKey') or '').strip()
+-                except Exception:
+-                    payload = {}
+-            if not api_key:
+-                self._send(401, {'code': 401, 'message': '缺少接入凭证 X-Pay-Key'})
+-                return
+-            conn = sqlite3.connect(DB_PATH)
+-            row = conn.execute('SELECT id, code, name, status, enabled FROM payment_merchants WHERE api_key=?',
+-                               (api_key,)).fetchone()
+-            if not row:
+-                conn.close()
+-                self._send(401, {'code': 401, 'message': '接入凭证无效'})
+-                return
+-            if not row[4]:
+-                conn.close()
+-                self._send(403, {'code': 403, 'message': '接入方已停用'})
+-                return
+-            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+-            conn.execute("UPDATE payment_merchants SET status='active', last_seen_at=?, callback_url=COALESCE(callback_url, '') WHERE api_key=?",
+-                         (now, api_key))
+-            conn.commit()
+-            conn.close()
+-            self._send(200, {'code': 0, 'data': {'id': row[0], 'code': row[1], 'name': row[2],
+-                                                'status': 'active', 'lastSeenAt': now}})
+-        elif self.path.startswith('/api/tuppoau/payment/tickets/process'):
+-            # 工单处理：resolve（标记完成）/ change_address（执行地址变更 + 标记完成）
+-            length = int(self.headers.get('Content-Length') or 0)
+-            try:
+-                payload = json.loads(self.rfile.read(length).decode('utf-8')) if length else {}
+-            except Exception:
+-                payload = {}
+-            tid = int(payload.get('id') or 0)
+-            action = str(payload.get('action') or 'resolve').strip()
+-            conn = sqlite3.connect(DB_PATH)
+-            row = conn.execute('SELECT id, ticket_no, merchant_code, chain, new_address, status FROM payment_tickets WHERE id=?',
+-                               (tid,)).fetchone()
+-            if not row:
+-                conn.close()
+-                self._send(404, {'code': 404, 'message': '工单不存在'})
+-                return
+-            if row[5] in ('done', 'rejected'):
+-                conn.close()
+-                self._send(400, {'code': 400, 'message': '工单已处理，不可重复操作'})
+-                return
+-            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+-            remark = str(payload.get('remark') or '').strip()
+-            if action == 'change_address' and row[2] and row[3] and row[4]:
+-                # 执行换址：更新对应接入方该链收款地址（新地址入库，SDK 需重新下发）
+-                _col = {'TRON': 'tron_address', 'ETH': 'eth_address', 'BSC': 'bsc_address', 'SOL': 'sol_address'}.get(row[3])
+-                if not _col:
+-                    conn.close()
+-                    self._send(400, {'code': 400, 'message': '不支持的链：%s' % row[3]})
+-                    return
+-                conn.execute("UPDATE payment_merchants SET %s=? WHERE code=?" % _col,
+-                             (row[4], row[2]))
+-                conn.execute("UPDATE payment_tickets SET status='done', remark=?, updated_at=? WHERE id=?",
+-                             (remark or '已执行换址（需重新下发 SDK 接入包）', now, tid))
+-                conn.commit()
+-                conn.close()
+-                self._send(200, {'code': 0, 'data': {'status': 'done', 'message': '换址已执行，接入方收款地址已更新（需重新下发 SDK 接入包）'}})
+-                return
+-            conn.execute("UPDATE payment_tickets SET status='done', remark=?, updated_at=? WHERE id=?",
+-                         (remark or '已处理', now, tid))
+-            conn.commit()
+-            conn.close()
+-            self._send(200, {'code': 0, 'data': {'status': 'done', 'message': '工单已标记完成'}})
+-        elif self.path.startswith('/api/tuppoau/payment/ticket'):
+-            # 工单提交（官网接入方/客服创建）：换址等诉求
+-            length = int(self.headers.get('Content-Length') or 0)
+-            try:
+-                payload = json.loads(self.rfile.read(length).decode('utf-8')) if length else {}
+-            except Exception:
+-                payload = {}
+-            merchant_code = str(payload.get('merchantCode') or '').strip()
+-            merchant_name = str(payload.get('merchantName') or '').strip()
+-            email = str(payload.get('contactEmail') or '').strip().lower()
+-            chain = str(payload.get('chain') or '').strip().upper()
+-            new_address = str(payload.get('newAddress') or '').strip()
+-            reason = str(payload.get('reason') or '').strip()
+-            if not merchant_code or not email:
+-                self._send(400, {'code': 400, 'message': '接入方代号与联系邮箱必填'})
+-                return
+-            if chain not in ('TRON', 'ETH', 'BSC', 'SOL'):
+-                self._send(400, {'code': 400, 'message': '仅支持 TRON/ETH/BSC/SOL 换址工单'})
+-                return
+-            if not new_address:
+-                self._send(400, {'code': 400, 'message': '新收款地址必填'})
+-                return
+-            conn = sqlite3.connect(DB_PATH)
+-            mrow = conn.execute('SELECT name, tron_address, eth_address, bsc_address, sol_address FROM payment_merchants WHERE code=?',
+-                                (merchant_code,)).fetchone()
+-            if not mrow:
+-                conn.close()
+-                self._send(404, {'code': 404, 'message': '接入方不存在'})
+-                return
+-            _col = {'TRON': 1, 'ETH': 2, 'BSC': 3, 'SOL': 4}[chain]
+-            old_addr = mrow[_col] or ''
+-            if not old_addr:
+-                conn.close()
+-                self._send(400, {'code': 400, 'message': '该接入方未配置 %s 收款链路' % chain})
+-                return
+-            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+-            ticket_no = 'TK' + now.replace('-', '').replace(':', '').replace(' ', '') + str(int(time.time() * 1000) % 1000)
+-            conn.execute(
+-                "INSERT INTO payment_tickets(ticket_no, merchant_code, merchant_name, contact_email, type, chain, old_address, new_address, reason, status, created_at, updated_at) "
+-                "VALUES(?,?,?,?,?,?,?,?,?,'open',?,?)",
+-                (ticket_no, merchant_code, merchant_name or mrow[0], email, 'change_address',
+-                 chain, old_addr, new_address, reason or '申请更换收款地址', now, now))
+-            conn.commit()
+-            conn.close()
+-            self._send(200, {'code': 0, 'data': {'ticketNo': ticket_no, 'status': 'open',
+-                                                'message': '换址工单已提交，客服处理后将以新地址重新下发 SDK 接入包'}})
+-        elif self.path.startswith('/api/tuppoau/payment/config'):
+-            # 通道配置保存（地址 / 启停 / 超时 / 回调密钥）
+-            length = int(self.headers.get('Content-Length') or 0)
+-            try:
+-                payload = json.loads(self.rfile.read(length).decode('utf-8')) if length else {}
+-            except Exception:
+-                payload = {}
+-            saved = save_payment_config(bool(payload.get('enabled', True)),
+-                                        payload.get('address') or '',
+-                                        payload.get('ttlMinutes') or 30,
+-                                        payload.get('callbackSecret') or '')
+-            self._send(200, {'code': 0, 'data': saved})
+-        elif self.path.startswith('/api/tuppoau/payment/order'):
+-            # Ultima Pay 自助下单（官网/任意需求方前端调用）：锁定金额并返回收款信息
+-            length = int(self.headers.get('Content-Length') or 0)
+-            try:
+-                payload = json.loads(self.rfile.read(length).decode('utf-8')) if length else {}
+-            except Exception:
+-                payload = {}
+-            # 订单归属接入方：请求头 X-Pay-Key 匹配则绑定对应接入方，否则默认官方站
+-            merchant = 'ultima-gold'
+-            _api_key = str(self.headers.get('X-Pay-Key') or '').strip()
+-            if _api_key:
+-                _m = sqlite3.connect(DB_PATH).execute(
+-                    'SELECT code FROM payment_merchants WHERE api_key=? AND enabled=1', (_api_key,)).fetchone()
+-                if _m:
+-                    merchant = _m[0]
+-            # 订单归属用户（UGP-24）：可信会话优先，无会话拒绝；不信任正文 user 参数
+-            _su = self._session_user()
+-            if not _su:
+-                self._send(401, {'code': 401, 'message': '请先登录'})
+-                return
+-            _owner = _su.get('username') or _su.get('user') or payload.get('user') or ''
+-            row, err = create_payment_order(_owner, payload.get('planId') or '',
+-                                            payload.get('channel') or 'TRON', merchant)
+-            if err:
+-                self._send(400, {'code': 400, 'message': err})
+-                return
+-            row = _payment_row(row)
+-            cfg = read_payment_config()
+-            ch = load_payment_channels().get(row['channel'], {})
+-            self._send(200, {'code': 0, 'data': {
+-                'orderNo': row['orderNo'], 'username': row['username'],
+-                'planId': row['planId'], 'planName': row['planName'],
+-                'channel': row['channel'], 'network': ch.get('network', row['channel']),
+-                'currency': ch.get('currency', 'USDT'),
+-                'amountUsdt': row['amountUsdt'], 'tail': row['tail'],
+-                'priceUsdt': row['priceUsdt'], 'discount': row['discount'],
+-                'status': row['status'], 'createdAt': row['createdAt'], 'expiredAt': row['expiredAt'],
+-                'address': row['receiveAddress'] or (ch.get('address') or cfg['address']),
+-                'ttlMinutes': cfg['ttlMinutes'],
+-            }})
+-        elif self.path.startswith('/api/tuppoau/payment/create'):
+-            # 发起支付订单：返回订单号 + 实付金额（含随机尾数，唯一防撞）
+-            length = int(self.headers.get('Content-Length') or 0)
+-            try:
+-                payload = json.loads(self.rfile.read(length).decode('utf-8')) if length else {}
+-            except Exception:
+-                payload = {}
+-            row, err = create_payment_order(payload.get('user') or 'gold_hunter', payload.get('planId') or 'SP-01')
+-            if err:
+-                self._send(400, {'code': 400, 'message': err})
+-                return
+-            self._send(200, {'code': 0, 'data': _payment_row(row)})
+-        elif self.path.startswith('/api/tuppoau/payment/callback'):
+-            # 外部回调（链上确认后主动推哈希）：金额必须与订单一致；密钥校验防伪造。
+-            # UGP-03：回调密钥未配置时必须拒绝（空密钥 = 免校验，属危险入口）；
+-            # 即使密钥通过，回调也只进入等待核验（submitted），不直接 confirmed。
+-            length = int(self.headers.get('Content-Length') or 0)
+-            try:
+-                payload = json.loads(self.rfile.read(length).decode('utf-8')) if length else {}
+-            except Exception:
+-                payload = {}
+-            secret = read_payment_config()['callbackSecret']
+-            got = self.headers.get('X-Pay-Secret') or ''
+-            if not secret:
+-                self._send(403, {'code': 403, 'message': '回调密钥未配置，拒绝处理回调'})
+-                return
+-            if got != secret:
+-                self._send(403, {'code': 403, 'message': '回调密钥校验失败'})
+-                return
+-            order_no = payload.get('orderNo') or ''
+-            tx_hash = payload.get('txHash') or ''
+-            amount = payload.get('amountUsdt')
+-            row, err = confirm_payment_order(order_no, tx_hash,
+-                                             float(amount) if amount is not None else None, source='callback')
+-            if err:
+-                self._send(400, {'code': 400, 'message': err})
+-                return
+-            self._send(200, {'code': 0, 'data': row})
+-        elif self.path.startswith('/api/tuppoau/payment/confirm'):
+-            # 客户端/运营回执提交：只进入等待核验（submitted），返回「等待核验」；
+-            # 到账确认权仅保留在服务端链上核验流程（当前未实现，见 UGP-16）。
+-            # UGP-03：客户端点击「已完成转账」提交任意/空哈希均不会增加权益或写 confirmed。
+-            length = int(self.headers.get('Content-Length') or 0)
+-            try:
+-                payload = json.loads(self.rfile.read(length).decode('utf-8')) if length else {}
+-            except Exception:
+-                payload = {}
+-            row, err = confirm_payment_order(payload.get('orderNo') or '', payload.get('txHash') or '', None, 'receipt')
+-            if err:
+-                self._send(400, {'code': 400, 'message': err})
+-                return
+-            self._send(200, {'code': 0, 'data': row})
+-        elif self.path.startswith('/api/tuppoau/payment/expire'):
+-            # 手动标记失效（运营兜底）
+-            length = int(self.headers.get('Content-Length') or 0)
+-            try:
+-                payload = json.loads(self.rfile.read(length).decode('utf-8')) if length else {}
+-            except Exception:
+-                payload = {}
+-            order_no = payload.get('orderNo') or ''
+-            conn = sqlite3.connect(DB_PATH)
+-            cur = conn.execute("UPDATE payment_orders SET status='expired' WHERE order_no=? AND status='pending'",
+-                               (order_no,))
+-            conn.commit()
+-            n = cur.rowcount
+-            conn.close()
+-            self._send(200, {'code': 0, 'data': {'affected': n}})
+         elif self.path.startswith('/api/tuppoau/system/gaps/resolve'):
+             length = int(self.headers.get('Content-Length') or 0)
+             try:
+@@ -3776,7 +2819,8 @@ class Handler(BaseHTTPRequestHandler):
+             if not os.path.isfile(fp):
+                 self._send(404, {'code': 404, 'message': '官网文件不存在'})
+                 return
+-            body = open(fp, 'rb').read()
++            page = open(fp, 'r', encoding='utf-8').read()
++            body = page.replace('__ULTIMAPAY_BASE_URL__', ULTIMAPAY_BASE_URL).encode('utf-8')
+             self.send_response(200)
+             self.send_header('Content-Type', 'text/html; charset=utf-8')
+             self.send_header('Content-Length', str(len(body)))
+@@ -3799,7 +2843,7 @@ def main():
+     else:
+         threading.Thread(target=fetch_loop, daemon=True).start()
+         threading.Thread(target=market_analysis_loop, daemon=True).start()
+-        threading.Thread(target=payment_loop, daemon=True).start()
++        threading.Thread(target=entitlement_loop, daemon=True).start()
+         threading.Thread(target=daily_stats_loop, daemon=True).start()
+     log('HTTP 服务启动: http://localhost:%d/api/tuppoau/news (entry=%s)' % (PORT, entry))
+     ThreadingHTTPServer(('127.0.0.1', PORT), Handler).serve_forever()
+diff --git a/backend/ultima_backend/db.py b/backend/ultima_backend/db.py
+index 3227e4e..237a08d 100644
+--- a/backend/ultima_backend/db.py
++++ b/backend/ultima_backend/db.py
+@@ -12,7 +12,7 @@ db —— 唯一业务数据库权威：版本化迁移（UGP-08）
+ import sqlite3
+ from datetime import datetime
+ 
+-SCHEMA_VERSION = 9  # 当前业务库 schema 版本
++SCHEMA_VERSION = 8  # 当前 Gold 业务库 schema 版本；支付会话由 UltimaPay 独立库接管
+ 
+ # ── 来源标签常量 ──
+ SRC_LIVE = 'live'                # 链上核验通过（真实资金证明）
+@@ -49,6 +49,8 @@ def _m001_order_source_tags(db):
+     added = []
+     for tbl in ('orders', 'payment_orders'):
+         cols = [r[1] for r in db.execute('PRAGMA table_info(%s)' % tbl).fetchall()]
++        if not cols:
++            continue  # 支付表拆至 UltimaPay 后，Gold 冷库不再要求 payment_orders 存在
+         if 'source' not in cols:
+             db.execute("ALTER TABLE %s ADD COLUMN source TEXT DEFAULT '%s'" % (tbl, SRC_TEST))
+             added.append(tbl)
+@@ -104,6 +106,8 @@ def _m004_payment_idempotency(db):
+       数据库保证并发金额分配唯一，撞分配返回忙而非扩大随机伪装成功。
+     幂等：仅缺列时添加；索引 IF NOT EXISTS。"""
+     cols = [r[1] for r in db.execute('PRAGMA table_info(payment_orders)').fetchall()]
++    if not cols:
++        return  # 独立 UltimaPay 拥有支付订单表；Gold 仅兼容历史存量库
+     for col, ddl in (('idempotency_key', 'TEXT'),
+                      ('amount_units', 'INTEGER'),
+                      ('asset_key', 'TEXT'),
+@@ -298,21 +302,6 @@ def _m008_invite_reward_log(db):
+                " ON invite_reward_log(inviter, created_at)")
+ 
+ 
+-def _m009_payment_pay_sessions(db):
+-    """M009（UGP-30）：第三方前端支付会话（短期限、订单作用域）。
+-    持久商户密钥只存在于商户服务端；浏览器仅持 session_token（绑定单一订单、过期即失效）。
+-    幂等：建表 IF NOT EXISTS。"""
+-    db.execute('''CREATE TABLE IF NOT EXISTS payment_pay_sessions(
+-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+-        session_token TEXT NOT NULL UNIQUE,
+-        order_no TEXT NOT NULL,
+-        merchant TEXT NOT NULL,
+-        expires_at TEXT NOT NULL,
+-        created_at TEXT NOT NULL)''')
+-    db.execute("CREATE INDEX IF NOT EXISTS idx_pay_session_order"
+-               " ON payment_pay_sessions(order_no)")
+-
+-
+ # 有序迁移定义（version 必须递增；已记录版本跳过 → 可重跑）
+ MIGRATIONS = [
+     {'version': 1, 'name': 'order_source_tags', 'fn': _m001_order_source_tags},
+@@ -323,7 +312,6 @@ MIGRATIONS = [
+     {'version': 6, 'name': 'ops_tables', 'fn': _m006_ops_tables},
+     {'version': 7, 'name': 'fulfillment_log', 'fn': _m007_fulfillment_log},
+     {'version': 8, 'name': 'invite_reward_log', 'fn': _m008_invite_reward_log},
+-    {'version': 9, 'name': 'payment_pay_sessions', 'fn': _m009_payment_pay_sessions},
+ ]
+ 
+ 
+diff --git a/backend/ultima_backend/payments/__init__.py b/backend/ultima_backend/payments/__init__.py
+deleted file mode 100644
+index 7637e67..0000000
+--- a/backend/ultima_backend/payments/__init__.py
++++ /dev/null
+@@ -1,633 +0,0 @@
+-# -*- coding: utf-8 -*-
+-"""
+-payments —— 支付域（UGP-06 从 feed_server 抽出，逻辑单份权威）
+-
+-覆盖：通道配置（静态元信息 + DB 可配置）、订单（创建/查询/回执/回调/超时失效）、
+-链上查账（TRON/EVM/SOL，RPC 池遍历）。UGP-03 止血规则保持：回执路径只写 submitted，
+-永不自动 confirmed/settled（onchain 核验流程未实现前）。
+-
+-DB 通过 `db` 参数注入；外部 Provider（链上 RPC、出站回调）调用发生在函数执行时。
+-模块 import 无副作用。
+-"""
+-import hashlib
+-import hmac
+-import json
+-import os
+-import random
+-import secrets
+-import sys
+-import urllib.request
+-import urllib.error
+-from datetime import datetime, timedelta
+-
+-from ..contracts import now_iso
+-from ..membership import read_subscription_plans  # 单向依赖：payments -> membership（套餐权威）
+-from .money import parse_amount_units, format_amount_units  # UGP-16 整数最小单位
+-from .assets import resolve_asset, decimals_for  # UGP-16 资产注册表（chain+network+contract）
+-
+-# ── 通道默认值 / RPC 端点（与 feed_server 原值一致）──
+-PAYMENT_ADDRESS_DEFAULT = 'TFa8L4TXqVPzdEQ5LgNCeEGDVJAbX22dA6'  # TRON TRC-20 收款地址（用户确认）
+-PAYMENT_TTL_DEFAULT = 30       # 下单后 30 分钟未到账自动失效
+-PAYMENT_POLL_SECONDS = 30      # 主动查链轮询间隔
+-TRONGRID_URL = 'https://api.trongrid.io/v1/accounts/%s/transactions/trc20'
+-SOLANA_RPC_DEFAULT = 'https://api.mainnet-beta.solana.com'  # 公共 RPC 可配置（正式运营建议境外/付费端点）
+-USDT_SPL_MINT = 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB'  # Solana 主网 USDT SPL-token
+-EVM_USDT = {
+-    'ETH': ('0xdAC17F958D2ee523a2206206994597C13D831ec7', 6),   # USDT ERC-20 / 6 位
+-    'BSC': ('0x55d398326f99059fF775485246999027B3197955', 18),  # USDT BEP-20 / 18 位
+-}
+-TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
+-
+-# ── 支付链适配器登记（Ultima Pay 多链聚合）──
+-# address 为空表示该链收款地址未配置（通道未开通，下单会明确拒绝）
+-# rpcUrl 为主查询端点，rpcBackup 为备选池（逗号分隔，主端点连不上时自动切换尝试）
+-_PAYMENT_CHANNELS = {
+-    'TRON': {'name': 'TRON', 'network': 'TRON TRC-20', 'currency': 'USDT',
+-             'address': PAYMENT_ADDRESS_DEFAULT, 'enabled': True,
+-             'rpcUrl': 'https://api.trongrid.io', 'rpcBackup': ''},
+-    'ETH': {'name': 'Ethereum', 'network': 'Ethereum ERC-20', 'currency': 'USDT',
+-            'address': '0x421565A03A43857BdcAB534FB8C8fD1C3158E06a', 'enabled': True,
+-            'rpcUrl': 'https://ethereum.publicnode.com',
+-            'rpcBackup': 'https://ethereum-rpc.publicnode.com,https://rpc.ankr.com/eth,https://eth.llamarpc.com'},
+-    'BSC': {'name': 'BSC', 'network': 'BSC BEP-20', 'currency': 'USDT',
+-            'address': '0x421565A03A43857BdcAB534FB8C8fD1C3158E06a', 'enabled': True,
+-            'rpcUrl': 'https://bsc-dataseed.bnbchain.org',
+-            'rpcBackup': 'https://bsc-dataseed.binance.org,https://rpc.ankr.com/bsc'},
+-    'SOL': {'name': 'Solana', 'network': 'Solana SPL · USDT', 'currency': 'USDT',
+-            'address': '', 'enabled': False,  # 地址待配置；DB payment_channel_config 覆盖
+-            'rpcUrl': 'https://solana-rpc.publicnode.com',
+-            'rpcBackup': 'https://api.mainnet-beta.solana.com,https://rpc.ankr.com/solana'},
+-}
+-
+-
+-def _log(msg):
+-    print('[ultima_backend.payments] %s' % msg, file=sys.stderr, flush=True)
+-
+-
+-def _rpc_list(db, ch):
+-    """该链查询端点池：[主端点] + 备选池（去空、去重）。"""
+-    c = _PAYMENT_CHANNELS.get(ch) or {}
+-    main = (c.get('rpcUrl') or '').strip()
+-    backup = [u.strip() for u in (c.get('rpcBackup') or '').split(',') if u.strip()]
+-    out = []
+-    for u in [main] + backup:
+-        if u and u not in out:
+-            out.append(u)
+-    return out
+-
+-
+-def load_payment_channels(db):
+-    """合并多链配置：静态元信息（名称/网络/币种/默认 RPC 池）+ 数据库可配置项（地址/RPC/启停）。
+-    DB 有记录则覆盖默认（地址留空=该链未开通；RPC 留空=用默认端点），无记录时回落静态默认。"""
+-    chs = json.loads(json.dumps(_PAYMENT_CHANNELS))
+-    try:
+-        rows = db.execute('SELECT channel, address, enabled, rpc_url, rpc_backup FROM payment_channel_config').fetchall()
+-    except Exception:
+-        rows = []
+-    for ch, address, enabled, rpc_url, rpc_backup in rows:
+-        if ch in chs:
+-            chs[ch]['address'] = address or ''
+-            chs[ch]['enabled'] = bool(enabled)
+-            if rpc_url:
+-                chs[ch]['rpcUrl'] = rpc_url
+-            if rpc_backup is not None:
+-                chs[ch]['rpcBackup'] = rpc_backup or ''
+-    return chs
+-
+-
+-def read_payment_config(db):
+-    """支付通道配置：地址 / 启停 / 超时分钟 / 官网回调密钥。"""
+-    row = db.execute('SELECT enabled, address, ttl_minutes, callback_secret FROM payment_config WHERE id=1').fetchone()
+-    if not row:
+-        return {'enabled': True, 'address': PAYMENT_ADDRESS_DEFAULT, 'ttlMinutes': PAYMENT_TTL_DEFAULT,
+-                'callbackSecret': ''}
+-    return {'enabled': bool(row[0]), 'address': row[1] or PAYMENT_ADDRESS_DEFAULT,
+-            'ttlMinutes': row[2] or PAYMENT_TTL_DEFAULT, 'callbackSecret': row[3] or ''}
+-
+-
+-def save_payment_config(db, enabled, address, ttl_minutes, callback_secret=''):
+-    """保存通道配置（后台通道卡修改入口）。"""
+-    address = (address or '').strip() or PAYMENT_ADDRESS_DEFAULT
+-    ttl = max(1, min(1440, int(ttl_minutes or PAYMENT_TTL_DEFAULT)))
+-    db.execute('INSERT INTO payment_config(id, enabled, address, ttl_minutes, callback_secret, updated_at)'
+-               " VALUES(1, ?, ?, ?, ?, ?)"
+-               " ON CONFLICT(id) DO UPDATE SET enabled=excluded.enabled, address=excluded.address,"
+-               " ttl_minutes=excluded.ttl_minutes, callback_secret=excluded.callback_secret,"
+-               " updated_at=excluded.updated_at",
+-               (1 if enabled else 0, address, ttl, callback_secret or '', now_iso()))
+-    db.commit()
+-    return {'enabled': bool(enabled), 'address': address, 'ttlMinutes': ttl, 'callbackSecret': callback_secret or ''}
+-
+-
+-def payment_expire_at(db):
+-    return (datetime.now() + timedelta(minutes=read_payment_config(db)['ttlMinutes'])).strftime('%Y-%m-%d %H:%M:%S')
+-
+-
+-def plan_by_id(db, plan_id):
+-    for p in read_subscription_plans(db):
+-        if p['id'] == plan_id:
+-            return p
+-    return None
+-
+-
+-# ── 链 → 资产注册表键（chain@network:contract/mint，与 assets 注册表一致）──
+-_CHANNEL_ASSET = {
+-    'TRON': ('tron', 'mainnet', 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t'),
+-    'ETH': ('eth', 'mainnet', '0xdAC17F958D2ee523a2206206994597C13D831ec7'),
+-    'BSC': ('bsc', 'mainnet', '0x55d398326f99059fF775485246999027B3197955'),
+-    'SOL': ('sol', 'mainnet', 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB'),
+-}
+-
+-
+-def asset_for_channel(channel):
+-    """通道 → 资产注册表项（chain+network+contract 定位；未登记/停用 → None）。"""
+-    spec = _CHANNEL_ASSET.get(channel)
+-    if not spec:
+-        return None
+-    a = resolve_asset(*spec)
+-    if not a or not a.get('enabled', True):
+-        return None
+-    return a
+-
+-
+-def lock_payment_intent(db, plan, channel='TRON', receive_address=None, product_ref='tuppoau',
+-                        merchant='ultima-gold', test_asset=None):
+-    """C3 PaymentIntent：服务端锁定商品价格快照（整数最小单位）、折扣是否已包含、
+-    期限/赠期与收款地址。**前端不能自行算价格**：显示价/币种精度/网络/收款地址等
+-    客户端参数一律不采纳，锁定完全由服务端套餐权威库 + 资产注册表决定。
+-
+-    返回 (intent, None) 或 (None, 原因)。
+-    intent = {product_ref, plan_id, plan_name, asset{chain,network,contract/mint,decimals,symbol},
+-              price_units, amount_units, amount_decimal, discount_included, tail_units,
+-              duration_days, bonus_days, receive_address, channel, locked_at_utc}
+-    """
+-    cfg = read_payment_config(db)
+-    if not cfg['enabled']:
+-        return None, '支付通道已停用，暂不能下单'
+-    asset = test_asset or asset_for_channel(channel)
+-    if asset is None:
+-        return None, '不支持的支付链 %s（未登记资产/通道停用）' % channel
+-    if plan is None or plan.get('product') != 'tuppoau':
+-        return None, '套餐不存在或非 Ultima Gold 套餐'
+-    if not plan.get('enabled'):
+-        return None, '该套餐已停用，暂不能购买'
+-    price = plan.get('priceUsdt')
+-    if price is None or price <= 0:
+-        return None, '该套餐无需支付（体验卡 0 价）'
+-    decimals = asset['decimals']
+-    try:
+-        price_units = parse_amount_units(str(price), decimals)
+-    except ValueError as e:
+-        return None, '套餐价无法用该链最小单位精确表示: %s' % e
+-    # 尾数避让（现有防撞单机制，UGP-17 改为按链/地址/窗口分配）：同样以最小单位加
+-    tail_units = 0
+-    for _ in range(20):
+-        tail_units = round(random.randint(1, 9) * (10 ** (decimals - 1)))  # 0.1~0.9 最小单位尾数
+-        amount_units = price_units + tail_units
+-        hit = db.execute("SELECT order_no FROM payment_orders WHERE amount_usdt=? AND status IN ('pending','paid')",
+-                         (float(format_amount_units(amount_units, decimals)),)).fetchone()
+-        if not hit:
+-            break
+-    else:
+-        return None, '尾数避让失败，请重试'
+-    receive = (receive_address or '').strip()
+-    if not receive:
+-        supported = load_payment_channels(db)
+-        receive = (supported.get(channel) or {}).get('address') or ''
+-    if not receive:
+-        return None, '%s 链收款地址未配置，通道暂未开通' % (asset.get('symbol') or channel)
+-    return {
+-        'product_ref': product_ref,
+-        'plan_id': plan.get('id'),
+-        'plan_name': plan.get('name'),
+-        'asset': {'chain': asset['chain'], 'network': asset['network'],
+-                  'contract': asset.get('contract') or asset.get('mint'),
+-                  'decimals': asset['decimals'], 'symbol': asset.get('symbol', 'USDT')},
+-        'price_units': price_units,
+-        'amount_units': amount_units,
+-        'amount_decimal': format_amount_units(amount_units, decimals),  # 十进制字符串，前端只展示不计算
+-        'discount_included': bool(plan.get('discount', 0)),
+-        'tail_units': tail_units,
+-        'duration_days': plan.get('durationDays') or plan.get('duration_days') or 0,
+-        'bonus_days': plan.get('bonusDays') or plan.get('bonus_days') or 0,
+-        'receive_address': receive,
+-        'channel': channel,
+-        'merchant': merchant or 'ultima-gold',
+-        'locked_at_utc': now_iso(),
+-    }, None
+-
+-
+-def verify_payment_intent(intent, plan, asset=None, amount_units=None, receive_address=None):
+-    """校验已锁定订单未被篡改：金额最小单位必须等于 套餐价+尾数 在资产精度下的精确值；
+-    显示价/币种精度/网络/收款地址任何偏离权威源 → 拒绝。返回 (ok, reason)。"""
+-    if not intent or not plan:
+-        return False, '缺少订单或套餐快照'
+-    asset = asset or intent.get('asset') or {}
+-    decimals = asset.get('decimals')
+-    if decimals is None:
+-        return False, '缺少资产精度'
+-    try:
+-        expect_price = parse_amount_units(str(plan.get('priceUsdt')), decimals)
+-    except ValueError as e:
+-        return False, '套餐价精度异常: %s' % e
+-    expect_amount = expect_price + int(intent.get('tail_units') or 0)
+-    if int(intent.get('amount_units') or 0) != expect_amount:
+-        return False, '金额被篡改：锁定 %d ≠ 权威 %d' % (intent.get('amount_units'), expect_amount)
+-    if int(intent.get('price_units') or 0) != expect_price:
+-        return False, '价格快照被篡改'
+-    # 显示面（十进制字符串）必须与最小单位一致：篡改显示价/精度 → 拒绝
+-    if format_amount_units(int(intent.get('amount_units') or 0), decimals) != (intent.get('amount_decimal') or ''):
+-        return False, '显示金额被篡改：与最小单位不一致'
+-    if receive_address is not None and (intent.get('receive_address') or '') != (receive_address or ''):
+-        return False, '收款地址被篡改'
+-    return True, 'OK'
+-
+-
+-def create_payment_order(db, username, plan_id, channel='TRON', merchant='ultima-gold'):
+-    """发起支付订单（Ultima Pay 自助下单）：金额 = 套餐价 + 随机一位小数尾数（查重避让，保证每单金额唯一）。
+-    channel 为支付链标识（多链聚合预留）；merchant 为订单归属接入方。
+-    UGP-16：金额先经 lock_payment_intent 整数最小单位锁定（服务端定价快照），前端不能自行算价格。"""
+-    cfg = read_payment_config(db)
+-    if not cfg['enabled']:
+-        return None, '支付通道已停用，暂不能下单'
+-    plan = plan_by_id(db, plan_id)
+-    if not plan or plan.get('product') != 'tuppoau':
+-        return None, '套餐不存在或非 Ultima Gold 套餐'
+-    if not plan.get('enabled'):
+-        return None, '该套餐已停用，暂不能购买'
+-    if plan.get('priceUsdt') is None or plan['priceUsdt'] <= 0:
+-        return None, '该套餐无需支付（体验卡 0 价）'
+-    user = db.execute('SELECT username FROM users WHERE username=?', (username,)).fetchone()
+-    if not user:
+-        return None, '用户不存在'
+-    # 收款地址双轨：接入方自配优先（tron/eth/bsc/sol_address），未配回退平台通道默认地址
+-    receive = ''
+-    _mrow = db.execute('SELECT tron_address, eth_address, bsc_address, sol_address FROM payment_merchants WHERE code=?',
+-                       (merchant,)).fetchone()
+-    if _mrow:
+-        _idx = {'TRON': 0, 'ETH': 1, 'BSC': 2, 'SOL': 3}.get(channel)
+-        if _idx is not None and (_mrow[_idx] or '').strip():
+-            receive = _mrow[_idx].strip()
+-    intent, err = lock_payment_intent(db, plan, channel=channel, receive_address=receive,
+-                                      product_ref='tuppoau', merchant=merchant)
+-    if err:
+-        return None, err
+-    ok, verr = verify_payment_intent(intent, plan, receive_address=intent['receive_address'])
+-    if not ok:
+-        return None, '订单锁定校验失败: %s' % verr
+-    decimals = intent['asset']['decimals']
+-    price_decimal = format_amount_units(intent['price_units'], decimals)
+-    amount_decimal = format_amount_units(intent['amount_units'], decimals)
+-    tail_decimal = format_amount_units(intent['tail_units'], decimals)
+-    order_no = 'PAY%s%04d' % (datetime.now().strftime('%Y%m%d%H%M%S'), random.randint(0, 9999))
+-    while db.execute('SELECT id FROM payment_orders WHERE order_no=?', (order_no,)).fetchone():
+-        order_no = 'PAY%s%04d' % (datetime.now().strftime('%Y%m%d%H%M%S'), random.randint(0, 9999))
+-    now = now_iso()
+-    db.execute('INSERT INTO payment_orders(order_no, username, plan_id, plan_name, price_usdt, discount,'
+-               ' amount_usdt, tail, status, created_at, expired_at, channel, merchant, receive_address)'
+-               ' VALUES(?,?,?,?,?,?,?,?,\'pending\',?,?,?,?,?)',
+-               (order_no, username, plan_id, plan['name'], float(price_decimal), plan['discount'],
+-                float(amount_decimal), float(tail_decimal), now, payment_expire_at(db),
+-                channel, merchant or 'ultima-gold', intent['receive_address']))
+-    db.commit()
+-    row = db.execute('SELECT * FROM payment_orders WHERE order_no=?', (order_no,)).fetchone()
+-    return row, None
+-
+-
+-def payment_row(r):
+-    return {'id': r[0], 'orderNo': r[1], 'username': r[2], 'planId': r[3], 'planName': r[4],
+-            'priceUsdt': r[5], 'discount': r[6], 'amountUsdt': r[7], 'tail': r[8],
+-            'status': r[9], 'txHash': r[10], 'createdAt': r[11], 'paidAt': r[12], 'expiredAt': r[13],
+-            'channel': r[14] if len(r) > 14 else 'TRON',
+-            'merchant': r[15] if len(r) > 15 else 'ultima-gold',
+-            'receiveAddress': r[16] if len(r) > 16 else '',
+-            'callbackStatus': r[17] if len(r) > 17 else '',
+-            'callbackAt': r[18] if len(r) > 18 else ''}
+-
+-
+-def read_payment_orders(db, status=None):
+-    if status and status != 'all':
+-        rows = db.execute('SELECT * FROM payment_orders WHERE status=? ORDER BY id DESC', (status,)).fetchall()
+-    else:
+-        rows = db.execute('SELECT * FROM payment_orders ORDER BY id DESC').fetchall()
+-    return [payment_row(r) for r in rows]
+-
+-
+-def read_merchant_orders(db, merchant, status=None):
+-    """按接入方查收款侧支付流水 + 汇总统计（接入方管理「查看」抽屉数据源）。"""
+-    if status and status != 'all':
+-        rows = db.execute('SELECT * FROM payment_orders WHERE merchant=? AND status=? ORDER BY id DESC',
+-                          (merchant, status)).fetchall()
+-    else:
+-        rows = db.execute('SELECT * FROM payment_orders WHERE merchant=? ORDER BY id DESC', (merchant,)).fetchall()
+-    stats = db.execute(
+-        "SELECT COUNT(*),"
+-        " SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END),"
+-        " SUM(CASE WHEN status='confirmed' THEN 1 ELSE 0 END),"
+-        " SUM(CASE WHEN status='expired' THEN 1 ELSE 0 END),"
+-        " COALESCE(SUM(CASE WHEN status='confirmed' THEN amount_usdt ELSE 0 END), 0)"
+-        " FROM payment_orders WHERE merchant=?", (merchant,)).fetchone()
+-    return [payment_row(r) for r in rows], {
+-        'total': stats[0] or 0,
+-        'pending': stats[1] or 0,
+-        'confirmed': stats[2] or 0,
+-        'expired': stats[3] or 0,
+-        'confirmedUsdt': round(stats[4] or 0, 2),
+-    }
+-
+-
+-def read_payment_order(db, order_no):
+-    """单笔订单详情（Ultima Pay 订单状态查询）。"""
+-    row = db.execute('SELECT * FROM payment_orders WHERE order_no=?', (order_no,)).fetchone()
+-    return payment_row(row) if row else None
+-
+-
+-def conn_row(db, order_no):
+-    r = db.execute('SELECT * FROM payment_orders WHERE order_no=?', (order_no,)).fetchone()
+-    return r
+-
+-
+-def confirm_payment_order(db, order_no, tx_hash, amount_usdt=None, source='receipt'):
+-    """提交支付回执 → 进入等待核验（submitted），不直接确认到账。
+-
+-    UGP-03 止血规则：
+-    - 仅 source='onchain'（通过链上深度/连续确认的核验流程）可写 confirmed；
+-      该流程当前未实现（见 UGP-16），故任何路径都不会自动 settled。
+-    - 客户端回执 / 手动核销 / 外部回调 / 轮询记录（receipt/manual/callback/poll）
+-      一律只标记 submitted，不开通权益、不发确认回调，返回「等待核验」。
+-    - 空哈希、任意哈希提交均不会增加权益或写 confirmed。
+-    """
+-    row = db.execute('SELECT * FROM payment_orders WHERE order_no=?', (order_no,)).fetchone()
+-    if not row:
+-        return None, '订单不存在'
+-    if row[9] != 'pending':
+-        return None, '订单状态为 %s，不可确认' % row[9]
+-    if amount_usdt is not None and abs(amount_usdt - row[7]) > 0.005:
+-        return None, '金额不匹配：订单 %.2f，到账 %.2f' % (row[7], amount_usdt)
+-    if source == 'onchain':
+-        # 链上核验流程占位：未实现 ADR 深度/连续确认门前不放开自动确认
+-        return None, '链上核验流程尚未启用，无法确认到账'
+-    # 回执路径：只记录 submitted（等待核验），绝不直接 confirmed / 开通权益 / 发回调；
+-    # 来源标签：回执/手动/回调/轮询路径一律 test（未核验占位），链上核验（UGP-16 后）才可 live
+-    now = now_iso()
+-    db.execute("UPDATE payment_orders SET status='submitted', tx_hash=?, paid_at=?, source='test' WHERE order_no=?",
+-               (tx_hash or '', now, order_no))
+-    db.commit()
+-    return payment_row(conn_row(db, order_no)), None
+-
+-
+-def deliver_merchant_callback(db, order_no):
+-    """订单确认后向接入方 callback_url 推送支付结果（出站回调，HMAC-SHA256 签名）。
+-    接入方无 callback_url → 标记 skipped（不重试）；发送失败 → failed 交轮询重试。"""
+-    try:
+-        row = conn_row(db, order_no)
+-        if not row or row[9] != 'confirmed':
+-            return
+-        merchant_code = row[15]
+-        if not merchant_code:
+-            return
+-        m = db.execute('SELECT code, callback_url, secret FROM payment_merchants WHERE code=?', (merchant_code,)).fetchone()
+-        if not m:
+-            return
+-        callback_url = (m[1] or '').strip()
+-        secret = m[2] or ''
+-        payload = {
+-            'event': 'payment.confirmed',
+-            'orderNo': row[1],
+-            'merchantCode': merchant_code,
+-            'username': row[2],
+-            'planId': row[3],
+-            'planName': row[4],
+-            'amountUsdt': round(row[7], 2),
+-            'tail': row[8],
+-            'channel': row[14],
+-            'txHash': row[10],
+-            'confirmedAt': row[12],
+-            'status': 'confirmed',
+-        }
+-        now = now_iso()
+-        if not callback_url:
+-            db.execute("UPDATE payment_orders SET callback_status='skipped', callback_at=? WHERE order_no=?", (now, order_no))
+-            db.commit()
+-            return
+-        attempts = (row[19] or 0) + 1
+-        body = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode('utf-8')
+-        headers = {'Content-Type': 'application/json', 'User-Agent': 'UltimaPay/1.0'}
+-        if secret:
+-            headers['X-Pay-Signature'] = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+-        req = urllib.request.Request(callback_url, data=body, headers=headers, method='POST')
+-        ok = False
+-        try:
+-            with urllib.request.urlopen(req, timeout=10) as resp:
+-                ok = resp.status in (200, 201, 202, 204)
+-        except Exception as e:
+-            _log('出站回调失败 %s -> %s: %s' % (order_no, callback_url, e))
+-        db.execute("UPDATE payment_orders SET callback_status=?, callback_at=?, callback_attempts=? WHERE order_no=?",
+-                   ('success' if ok else 'failed', now, attempts, order_no))
+-        db.commit()
+-        _log('出站回调 %s: %s (attempt %d)' % (order_no, 'success' if ok else 'failed', attempts))
+-    except Exception as e:
+-        _log('出站回调异常 %s: %s' % (order_no, e))
+-
+-
+-def retry_payment_callbacks(db):
+-    """轮询补发：已确认但回调未成功的订单（failed/pending/空），最多重试 5 次。"""
+-    rows = db.execute(
+-        "SELECT order_no FROM payment_orders WHERE status='confirmed'"
+-        " AND (callback_status IS NULL OR callback_status IN ('', 'failed', 'pending'))"
+-        " AND callback_attempts < 5").fetchall()
+-    for (order_no,) in rows:
+-        deliver_merchant_callback(db, order_no)
+-    return len(rows)
+-
+-
+-def expire_stale_orders(db):
+-    """超时（默认 30 分钟）未到账 → 失效。"""
+-    now = now_iso()
+-    cur = db.execute("UPDATE payment_orders SET status='expired' WHERE status='pending' AND expired_at < ?", (now,))
+-    db.commit()
+-    return cur.rowcount
+-
+-
+-def rotate_merchant_secret(db, code):
+-    """受控一次性轮换商户接入凭据（secret）：旧值立即失效；新值仅本次返回（一次性领用）。
+-
+-    持久密钥不编进浏览器 SDK/公开邮件附件；轮换后 SDK 需重新下发。
+-    """
+-    new_secret = secrets.token_urlsafe(24)
+-    db.execute("UPDATE payment_merchants SET secret=? WHERE code=?", (new_secret, code))
+-    db.commit()
+-    return new_secret
+-
+-
+-def merchant_secret_ok(db, code, secret):
+-    """校验商户 secret 是否当前有效（轮换后旧值 False、新值 True）。"""
+-    row = db.execute('SELECT secret FROM payment_merchants WHERE code=?', (code,)).fetchone()
+-    return bool(row) and bool(row[0]) and hmac.compare_digest(row[0], secret or '')
+-
+-
+-def fetch_trc20_incoming(db, address):
+-    """主动查链：拉取收款地址最近 USDT（TRC-20）入账（金额=最小单位/1e6，含哈希）。
+-    遍历 TRON RPC 池（主端点连不上自动切换备选），全部失败返回空并记日志。"""
+-    pool = _rpc_list(db, 'TRON') or [TRONGRID_URL]
+-    last_err = None
+-    for rpc in pool:
+-        try:
+-            base = rpc.rstrip('/')
+-            if '/v1/accounts/' in base:
+-                url = TRONGRID_URL % address
+-            else:
+-                url = base + '/v1/accounts/%s/transactions/trc20' % address
+-            url += '?only_confirmed=true&only_to=true&limit=200'
+-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+-            data = json.loads(urllib.request.urlopen(req, timeout=10).read().decode())
+-            out = []
+-            for t in data.get('data', []) or []:
+-                sym = (t.get('token_info') or {}).get('symbol', '')
+-                if sym != 'USDT':
+-                    continue
+-                try:
+-                    amount = round(int(t.get('value', 0)) / 1e6, 2)
+-                except Exception:
+-                    continue
+-                out.append({'hash': t.get('transaction_id'), 'amount': amount,
+-                            'from': t.get('from'), 'to': t.get('to'),
+-                            'time': t.get('block_timestamp')})
+-            return out
+-        except Exception as e:
+-            last_err = '%s' % e
+-            _log('TRON 查链失败(%s): %s' % (rpc, e))
+-    _log('TRON RPC 池全部失败: %s' % last_err)
+-    return []
+-
+-
+-def evm_rpc_call(db, chain, method, params):
+-    """EVM JSON-RPC 调用：遍历该链 RPC 池，任一成功即返回结果；全部失败返回 None。"""
+-    pool = _rpc_list(db, chain)
+-    if not pool:
+-        return None
+-    body = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': method, 'params': params}).encode()
+-    last_err = None
+-    for url in pool:
+-        try:
+-            req = urllib.request.Request(url, data=body, headers={'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0'})
+-            resp = json.loads(urllib.request.urlopen(req, timeout=10).read().decode())
+-            if resp.get('error'):
+-                last_err = str(resp.get('error'))
+-                continue
+-            return resp.get('result')
+-        except Exception as e:
+-            last_err = '%s' % e
+-            _log('%s RPC 失败(%s): %s' % (chain, url, e))
+-    if last_err:
+-        _log('%s RPC 池全部失败: %s' % (chain, last_err))
+-    return None
+-
+-
+-def fetch_evm_incoming(db, address, chain='ETH'):
+-    """主动查链：EVM 链（ETH/BSC）USDT 入账查询。
+-    eth_getLogs 过滤 Transfer 事件（topic2=收款地址），data 中金额按链精度换算：
+-    ETH USDT=6 位、BSC USDT=18 位。区块范围取最近 3000 块。"""
+-    spec = EVM_USDT.get(chain)
+-    if not spec:
+-        return []
+-    contract, decimals = spec
+-    latest = evm_rpc_call(db, chain, 'eth_blockNumber', [])
+-    if not latest:
+-        return []
+-    try:
+-        latest_int = int(latest, 16)
+-    except Exception:
+-        return []
+-    from_block = max(latest_int - 3000, 0)
+-    to_topic = '0x' + '0' * 24 + address[2:].lower()
+-    logs = evm_rpc_call(db, chain, 'eth_getLogs', [{
+-        'address': contract,
+-        'fromBlock': hex(from_block),
+-        'toBlock': 'latest',
+-        'topics': [TRANSFER_TOPIC, None, to_topic],
+-    }])
+-    if not logs:
+-        return []
+-    out = []
+-    for lg in logs:
+-        data = lg.get('data') or ''
+-        if len(data) < 66:
+-            continue
+-        try:
+-            raw = int(data[2:66], 16)
+-        except Exception:
+-            continue
+-        amount = round(raw / (10 ** decimals), 2)
+-        if amount <= 0:
+-            continue
+-        topics = lg.get('topics') or []
+-        out.append({'hash': lg.get('transactionHash'), 'amount': amount,
+-                    'from': ('0x' + topics[1][-40:]) if len(topics) > 1 and topics[1] else '',
+-                    'to': address, 'time': None})
+-    return out
+-
+-
+-def solana_rpc(db, method, params):
+-    """Solana JSON-RPC 调用：遍历 SOL RPC 池（主端点连不上自动切换备选），全部失败返回 None。"""
+-    body = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': method, 'params': params}).encode()
+-    pool = _rpc_list(db, 'SOL') or [os.environ.get('SOLANA_RPC') or SOLANA_RPC_DEFAULT]
+-    last_err = None
+-    for url in pool:
+-        try:
+-            req = urllib.request.Request(url, data=body, headers={'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0'})
+-            resp = json.loads(urllib.request.urlopen(req, timeout=10).read().decode())
+-            if resp.get('error'):
+-                last_err = str(resp.get('error'))
+-                continue
+-            return resp.get('result')
+-        except Exception as e:
+-            last_err = '%s' % e
+-            _log('Solana RPC 失败(%s): %s' % (url, e))
+-    if last_err:
+-        _log('Solana RPC 池全部失败: %s' % last_err)
+-    return None
+-
+-
+-def fetch_solana_incoming(db, address):
+-    """主动查链：拉取 Solana 收款地址最近 USDT（SPL-token）入账。"""
+-    sigs = solana_rpc(db, 'getSignaturesForAddress', [address, {'limit': 30}])
+-    if not sigs:
+-        return []
+-    out = []
+-    for s in sigs:
+-        if not s.get('err') is None:  # 失败交易跳过
+-            continue
+-        tx = solana_rpc(db, 'getTransaction', [s['signature'], {'encoding': 'jsonParsed', 'maxSupportedTransactionVersion': 0}])
+-        if not tx:
+-            continue
+-        meta = tx.get('meta') or {}
+-        inner = meta.get('innerInstructions') or []
+-        found = False
+-        for ins in inner:
+-            for ix in ins.get('instructions', []):
+-                if ix.get('program') != 'spl-token':
+-                    continue
+-                parsed = ix.get('parsed') or {}
+-                if parsed.get('type') != 'transfer':
+-                    continue
+-                info = parsed.get('info') or {}
+-                if info.get('mint') != USDT_SPL_MINT:
+-                    continue
+-                if info.get('destination') != address:
+-                    continue
+-                amt = info.get('tokenAmount') or {}
+-                try:
+-                    amount = round(float(amt.get('uiAmount') or 0), 2)
+-                except Exception:
+-                    continue
+-                if amount <= 0:
+-                    continue
+-                out.append({'hash': s['signature'], 'amount': amount,
+-                            'from': info.get('source'), 'to': info.get('destination'),
+-                            'time': (tx.get('blockTime') or 0) * 1000})
+-                found = True
+-                break
+-            if found:
+-                break
+-    return out
+diff --git a/backend/ultima_backend/payments/api.py b/backend/ultima_backend/payments/api.py
+deleted file mode 100644
+index 69f3cc9..0000000
+--- a/backend/ultima_backend/payments/api.py
++++ /dev/null
+@@ -1,49 +0,0 @@
+-# -*- coding: utf-8 -*-
+-"""
+-payments/api —— 支付 API 薄适配层（UGP-17）
+-
+-从请求环境解析可信 principal（登录会话 / 商户凭据），委托 orders 域逻辑：
+-- create_payment_intent_endpoint：下单（幂等键 + 商品标识 + chain）；
+-- submit_receipt_endpoint：回执仅提交线索（进入待核验，异常进可审计队列）。
+-本模块不执行业务，仅做 principal 解析与端点接线；业务在 payments/orders。
+-"""
+-from ..auth.policy import principal_from_session, merchant_principal
+-from .orders import create_payment_intent, submit_receipt
+-
+-
+-def _resolve_principal(db, token, merchant=None, api_key=None):
+-    """可信会话优先；无会话时校验商户凭据（无效 → None，绝不回退官方商户）。"""
+-    p = principal_from_session(db, token)
+-    if p:
+-        return p, None
+-    if merchant and api_key:
+-        p, err = merchant_principal(db, merchant, api_key)
+-        if p:
+-            return p, None
+-        return None, err or '无效商户凭据'
+-    return None, '缺少可信会话或商户凭据'
+-
+-
+-def create_payment_intent_endpoint(db, token=None, merchant=None, api_key=None,
+-                                   product_ref=None, chain=None, idempotency_key=None,
+-                                   plan_id=None, receive_address=None):
+-    """端点处理器：解析 principal → orders.create_payment_intent。
+-    product_ref/chain/idempotency_key 必填；无效商户 key 直接拒绝。"""
+-    if not product_ref or not chain or not idempotency_key:
+-        return None, '缺少商品标识/支付链/幂等键'
+-    principal, err = _resolve_principal(db, token, merchant, api_key)
+-    if not principal:
+-        return None, err
+-    return create_payment_intent(db, principal, product_ref, chain, idempotency_key,
+-                                 plan_id=plan_id, merchant=merchant, receive_address=receive_address)
+-
+-
+-def submit_receipt_endpoint(db, order_no=None, tx_hash=None, amount_units=None,
+-                            token=None, merchant=None, api_key=None):
+-    """端点处理器：回执提交（仅线索）。"""
+-    if not order_no or not tx_hash:
+-        return None, '缺少订单号或交易哈希'
+-    principal, err = _resolve_principal(db, token, merchant, api_key)
+-    if not principal:
+-        return None, err
+-    return submit_receipt(db, order_no, tx_hash, amount_units=amount_units)
+diff --git a/backend/ultima_backend/payments/assets.py b/backend/ultima_backend/payments/assets.py
+deleted file mode 100644
+index cd6353e..0000000
+--- a/backend/ultima_backend/payments/assets.py
++++ /dev/null
+@@ -1,87 +0,0 @@
+-# -*- coding: utf-8 -*-
+-"""
+-payments/assets —— UGP-16 资产注册表（chain+network+contract/mint+decimals 定位）
+-
+-- 资产由 chain+network+contract/mint+decimals 唯一定位，**不按 USDT 符号判定**（symbol 仅展示）。
+-- 测试网与主网完全区分（同 chain 不同 network 是不同资产键）。
+-- ETH USDT ERC-20=6 位、BSC USDT BEP-20=18 位、TRON USDT TRC-20=6 位、SOL USDT SPL=6 位
+-  （与 payments/__init__.py EVM_USDT / USDT_SPL_MINT 既有事实一致，统一收敛到本注册表）。
+-"""
+-from .money import parse_amount_units, format_amount_units, amount_to_report  # noqa: F401
+-
+-# 主网注册表：key = chain@network:contract/mint
+-_ASSETS = {
+-    'ETH@mainnet:0xdAC17F958D2ee523a2206206994597C13D831ec7': {
+-        'chain': 'eth', 'network': 'mainnet', 'symbol': 'USDT',
+-        'contract': '0xdAC17F958D2ee523a2206206994597C13D831ec7', 'decimals': 6, 'enabled': True},
+-    'BSC@mainnet:0x55d398326f99059fF775485246999027B3197955': {
+-        'chain': 'bsc', 'network': 'mainnet', 'symbol': 'USDT',
+-        'contract': '0x55d398326f99059fF775485246999027B3197955', 'decimals': 18, 'enabled': True},
+-    'TRON@mainnet:TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t': {
+-        'chain': 'tron', 'network': 'mainnet', 'symbol': 'USDT',
+-        'contract': 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t', 'decimals': 6, 'enabled': True},
+-    'SOL@mainnet:Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB': {
+-        'chain': 'sol', 'network': 'mainnet', 'symbol': 'USDT',
+-        'mint': 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', 'decimals': 6, 'enabled': True},
+-}
+-
+-# 测试网注册表（与主网完全区分；供测试/沙箱注入）
+-_TEST_ASSETS = {
+-    'ETH@sepolia:0xdAC17F958D2ee523a2206206994597C13D831ec7': {
+-        'chain': 'eth', 'network': 'sepolia', 'symbol': 'USDT',
+-        'contract': '0xdAC17F958D2ee523a2206206994597C13D831ec7', 'decimals': 6, 'enabled': True},
+-    'BSC@testnet:0x337610d27c682E347C9cD60bd4b341b43F28c48f': {
+-        'chain': 'bsc', 'network': 'testnet', 'symbol': 'USDT',
+-        'contract': '0x337610d27c682E347C9cD60bd4b341b43F28c48f', 'decimals': 18, 'enabled': True},
+-    'TRON@shasta:TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj': {
+-        'chain': 'tron', 'network': 'shasta', 'symbol': 'USDT',
+-        'contract': 'TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj', 'decimals': 6, 'enabled': True},
+-    'SOL@devnet:Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB': {
+-        'chain': 'sol', 'network': 'devnet', 'symbol': 'USDT',
+-        'mint': 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', 'decimals': 6, 'enabled': True},
+-}
+-
+-
+-def register_asset(chain, network, contract_or_mint, decimals, symbol='USDT', enabled=True, test=False):
+-    """注册/覆盖资产（测试注入测试链用；test=True 写入测试网注册表）。"""
+-    reg = _TEST_ASSETS if test else _ASSETS
+-    key = '%s@%s:%s' % (chain.lower(), network.lower(), contract_or_mint)
+-    reg[key] = {'chain': chain.lower(), 'network': network.lower(), 'symbol': symbol,
+-                'contract': contract_or_mint, 'decimals': int(decimals), 'enabled': bool(enabled)}
+-    return key
+-
+-
+-def _match(reg, chain, network, contract_or_mint=None):
+-    chain = chain.lower()
+-    network = network.lower()
+-    for k, a in reg.items():
+-        if a['chain'] != chain or a['network'] != network:
+-            continue
+-        c = a.get('contract') or a.get('mint')
+-        if contract_or_mint is None or (c or '').lower() == contract_or_mint.lower():
+-            return dict(a)
+-    return None
+-
+-
+-def resolve_asset(chain, network, contract_or_mint=None, symbol=None, test=False):
+-    """按 chain+network+contract/mint 定位资产。不按 symbol 判定（symbol 仅供展示过滤）。
+-    未知组合 → None。test=True 时先查测试网注册表。"""
+-    reg = _TEST_ASSETS if test else _ASSETS
+-    a = _match(reg, chain, network, contract_or_mint)
+-    if a is None and test:
+-        a = _match(_ASSETS, chain, network, contract_or_mint)
+-    if a is None:
+-        return None
+-    if symbol is not None and a['symbol'].upper() != symbol.upper():
+-        return None   # 仅作展示一致性校验，不参与定位
+-    return a
+-
+-
+-def decimals_for(chain, network, contract_or_mint=None, test=False):
+-    a = resolve_asset(chain, network, contract_or_mint, test=test)
+-    return a['decimals'] if a else None
+-
+-
+-def all_assets(test=False):
+-    reg = _TEST_ASSETS if test else _ASSETS
+-    return [dict(v) for v in reg.values()]
+diff --git a/backend/ultima_backend/payments/callbacks.py b/backend/ultima_backend/payments/callbacks.py
+deleted file mode 100644
+index bc37d36..0000000
+--- a/backend/ultima_backend/payments/callbacks.py
++++ /dev/null
+@@ -1,69 +0,0 @@
+-# -*- coding: utf-8 -*-
+-"""payments/callbacks —— 出站回调投递（UGP-19）
+-
+-- deliver_callbacks：领取 outbox 事件 → 构造载荷（event_id + 认证签名 HMAC-SHA256）→
+-  网络 POST（可注入 http_post，默认 urllib）→ 成功 mark_delivered / 失败 mark_failed（有界重试+退避）；
+-- 回调失败 ≠ 未到账：payment_orders 已 confirmed 不回滚；独立 callback/fulfillment 状态；
+-- fulfillment_status：payment_status（orders）与 callback_status / fulfillment（权益应用，UGP-27 接入）
+-  分开——confirmed 不等于权益已开通；业务未处理显示 pending，回调失败显示 retry_required。
+-接入方必须按 event_id 幂等（载荷携带 event_id + 签名，重复投递由接入方去重）。
+-"""
+-import hashlib
+-import hmac
+-import json
+-import urllib.request
+-
+-from .outbox import claim_events, mark_delivered, mark_failed
+-
+-
+-def sign_payload(secret, event_id, order_no, payload_json):
+-    """认证签名：HMAC-SHA256(secret, canonical(event_id|order_no|payload))。"""
+-    canonical = '%s|%s|%s' % (event_id, order_no, payload_json)
+-    return hmac.new((secret or '').encode('utf-8'), canonical.encode('utf-8'),
+-                    hashlib.sha256).hexdigest()
+-
+-
+-def _default_post(url, data, timeout=10):
+-    req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
+-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+-        return resp.status
+-
+-
+-def deliver_callbacks(db, secret='', batch=10, http_post=None, now=None):
+-    """投递一批到期事件。http_post(url, body_bytes) 可注入（测试用）。
+-    返回 (delivered_count, failed_count)。"""
+-    http_post = http_post or _default_post
+-    evs = claim_events(db, batch=batch, now=now)
+-    delivered = failed = 0
+-    for ev in evs:
+-        payload = dict(ev['payload'])
+-        payload['event_id'] = ev['event_id']
+-        payload['order_no'] = ev['order_no']
+-        payload['signature'] = sign_payload(secret, ev['event_id'], ev['order_no'],
+-                                            json.dumps(payload, ensure_ascii=False, sort_keys=True))
+-        url = (payload.get('callback_url') or '').strip()
+-        if not url:
+-            mark_failed(db, ev['event_id'], '缺少 callback_url', now=now)
+-            failed += 1
+-            continue
+-        try:
+-            status = http_post(url, json.dumps(payload, ensure_ascii=False).encode('utf-8'))
+-            if 200 <= int(status) < 300:
+-                mark_delivered(db, ev['event_id'], now=now)
+-                delivered += 1
+-            else:
+-                mark_failed(db, ev['event_id'], 'HTTP %s' % status, now=now)
+-                failed += 1
+-        except Exception as e:
+-            mark_failed(db, ev['event_id'], '%s' % e, now=now)
+-            failed += 1
+-    return delivered, failed
+-
+-
+-def fulfillment_status(db, order_no):
+-    """独立状态：payment_status（orders）/ callback_status（事件投递）/ fulfillment（权益应用）。
+-    confirmed 不等于权益已开通；UGP-27 起 fulfillment 由 membership.fulfillment.fulfillment_status
+-    统一提供（applied=权益已开通 / pending=待履约 / skipped=待确认 / failed=失败可重试），
+-    未 applied 不显示会员已可用。此函数保留为旧调用方兼容入口。"""
+-    from ..membership.fulfillment import fulfillment_status as _fs
+-    return _fs(db, order_no)
+diff --git a/backend/ultima_backend/payments/chains/evm.py b/backend/ultima_backend/payments/chains/evm.py
+deleted file mode 100644
+index b12187a..0000000
+--- a/backend/ultima_backend/payments/chains/evm.py
++++ /dev/null
+@@ -1,78 +0,0 @@
+-# -*- coding: utf-8 -*-
+-"""payments/chains/evm —— EVM（ETH/BSC）Transfer 日志原始响应解析（UGP-18）
+-
+-输入 eth_getLogs / getTransactionReceipt 原始响应（dict），提取 Transfer 事件：
+-topic0=0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef
+-topic1=from（32 字节右对齐地址）、topic2=to、data=value(uint256)。
+-返回归一化链证据字段；关键字段缺失/非 Transfer → ValueError（明确拒绝）。"""
+-import binascii
+-
+-TRANSFER_TOPIC0 = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
+-
+-
+-def _addr_from_topic(topic):
+-    """topic 32 字节 → 0x 地址（取末 20 字节）。"""
+-    t = (topic or '').strip().lower()
+-    if not t.startswith('0x'):
+-        t = '0x' + t
+-    t = t[2:].zfill(64)
+-    return '0x' + t[-40:]
+-
+-
+-def _value_from_data(data):
+-    d = (data or '').strip().lower()
+-    if d.startswith('0x'):
+-        d = d[2:]
+-    if not d:
+-        return 0
+-    try:
+-        return int(d, 16)
+-    except ValueError:
+-        raise ValueError('data 不是合法 uint256')
+-
+-
+-def _block_int(v, name):
+-    if v is None:
+-        return None
+-    try:
+-        return int(str(v), 16) if isinstance(v, str) and v.startswith(('0x', '0X')) else int(v)
+-    except (TypeError, ValueError):
+-        raise ValueError('%s 非法' % name)
+-
+-
+-def parse_evm_log(raw, contract_hint=None, chain=None):
+-    """解析单条 Transfer log。raw 为日志对象（含 address/topics/data/blockNumber/logIndex/
+-    transactionHash/removed）；status 由 receipt 层提供（0x1 成功）。"""
+-    if not isinstance(raw, dict):
+-        raise ValueError('EVM 日志必须是对象')
+-    contract = (raw.get('address') or '').strip().lower()
+-    if not contract:
+-        raise ValueError('缺少日志合约地址')
+-    topics = raw.get('topics') or []
+-    if not topics or topics[0].lower() != TRANSFER_TOPIC0:
+-        raise ValueError('非 Transfer 事件（topic0 不匹配）')
+-    if contract_hint and contract != (contract_hint or '').lower():
+-        raise ValueError('合约地址与权威资产不匹配')
+-    if len(topics) < 3:
+-        raise ValueError('Transfer 事件缺少 from/to topic')
+-    from_ = _addr_from_topic(topics[1])
+-    to = _addr_from_topic(topics[2])
+-    value = _value_from_data(raw.get('data'))
+-    tx_hash = (raw.get('transactionHash') or raw.get('transaction_hash') or '').strip().lower()
+-    if not tx_hash:
+-        raise ValueError('缺少 transactionHash')
+-    if raw.get('removed'):
+-        raise ValueError('日志已被重组移除')
+-    block = _block_int(raw.get('blockNumber') or raw.get('block_number'), 'blockNumber')
+-    log_index = _block_int(raw.get('logIndex') or raw.get('log_index'), 'logIndex')
+-    ts = raw.get('block_time') or raw.get('timestamp')
+-    if ts is not None:
+-        try:
+-            ts = int(ts)
+-        except (TypeError, ValueError):
+-            raise ValueError('block_time 非法')
+-    return {'chain': (chain or 'evm').lower(), 'tx_hash': tx_hash, 'contract': contract,
+-            'from': from_, 'to': to, 'value': value, 'block': block,
+-            'log_index': log_index, 'block_time': ts,
+-            'confirmed': bool(raw.get('confirmed', True)),
+-            'depth': raw.get('depth')}
+diff --git a/backend/ultima_backend/payments/chains/solana.py b/backend/ultima_backend/payments/chains/solana.py
+deleted file mode 100644
+index 209b602..0000000
+--- a/backend/ultima_backend/payments/chains/solana.py
++++ /dev/null
+@@ -1,93 +0,0 @@
+-# -*- coding: utf-8 -*-
+-"""payments/chains/solana —— Solana transferChecked/ATA 原始响应解析（UGP-18）
+-
+-输入 Solana RPC getTransaction 原始响应（与 PayWindow @solana/web3.js + @solana/spl-token
+-同构构造结构），从外层/内层指令中提取 transferChecked：
+-- mint / amount（最小单位）/ authority / source / destination（收款 ATA）；
+-- ataFor（收款人地址，ATA 归属校验目标）；
+-- 交易结果（err 为空 + confirmationStatus confirmed/finalized）。
+-ATA 归属校验：destination 必须是对 ataFor（收款方）为该 mint 派生/存在的 token account——
+-本组件只认 fixture/调用方显式携带 ataFor 且 ataFor==收款地址的 transferChecked。
+-关键字段缺失/非 transferChecked/交易失败 → ValueError（明确拒绝，不静默跳过）。"""
+-
+-TRANSFER_CHECKED = 'transferChecked'
+-TRANSFER = 'transfer'
+-CREATE_ATA = 'createAssociatedTokenAccount'
+-
+-
+-def _collect_parsed(raw):
+-    """遍历外层 + 内层指令中的 parsed 指令。"""
+-    out = []
+-    tx = raw.get('transaction') or {}
+-    msg = tx.get('message') or {}
+-    for ins in msg.get('instructions') or []:
+-        parsed = ins.get('parsed') or {}
+-        if parsed.get('type'):
+-            out.append(parsed)
+-    meta = raw.get('meta') or {}
+-    for group in meta.get('innerInstructions') or []:
+-        for ins in group.get('instructions') or []:
+-            parsed = ins.get('parsed') or {}
+-            if parsed.get('type'):
+-                out.append(parsed)
+-    return out
+-
+-
+-def parse_solana_tx(raw, mint_hint=None):
+-    """解析单笔 Solana 交易中的 transferChecked（收款 ATA 入账）。
+-    mint_hint 为权威 mint（资产注册表）。返回归一化链证据 dict。"""
+-    if not isinstance(raw, dict):
+-        raise ValueError('Solana 原始响应必须是对象')
+-    err = raw.get('err')
+-    meta = raw.get('meta') or {}
+-    status = meta.get('status') or {}
+-    if err or status.get('Err'):
+-        raise ValueError('交易失败: %s' % (err or status.get('Err')))
+-    conf = (raw.get('confirmationStatus') or '').lower()
+-    if conf and conf not in ('confirmed', 'finalized'):
+-        raise ValueError('交易最终性不足: %s' % conf)
+-    parsed_list = _collect_parsed(raw)
+-    ev = None
+-    for p in parsed_list:
+-        if p.get('type') not in (TRANSFER_CHECKED, TRANSFER):
+-            continue
+-        info = p.get('info') or {}
+-        mint = info.get('mint')
+-        amount = info.get('amount')
+-        destination = info.get('destination')
+-        ata_for = info.get('ataFor')
+-        authority = info.get('authority')
+-        if p.get('type') == TRANSFER_CHECKED:
+-            if not mint or amount is None:
+-                raise ValueError('transferChecked 缺少 mint/amount')
+-            if mint_hint and (mint or '').lower() != (mint_hint or '').lower():
+-                raise ValueError('mint 与权威资产不匹配（同名伪资产）')
+-            try:
+-                value = int(amount)
+-            except (TypeError, ValueError):
+-                raise ValueError('amount 不是整数最小单位: %r' % amount)
+-            if value < 0:
+-                raise ValueError('金额为负')
+-            ev = {'mint': mint, 'value': value, 'destination': destination,
+-                  'ata_for': ata_for, 'authority': authority}
+-            break
+-        # 普通 transfer：无 mint 明确性，拒绝（本组件要求 transferChecked 精确定位资产）
+-        raise ValueError('普通 transfer 无法定位资产，拒绝')
+-    if ev is None:
+-        raise ValueError('未找到 transferChecked 指令')
+-    if not ev['destination']:
+-        raise ValueError('transferChecked 缺少收款 ATA')
+-    tx_hash = (raw.get('signature') or raw.get('transactionSignature') or '').strip()
+-    if not tx_hash:
+-        raise ValueError('缺少交易签名')
+-    slot = raw.get('slot')
+-    if slot is not None:
+-        try:
+-            slot = int(slot)
+-        except (TypeError, ValueError):
+-            raise ValueError('slot 非法')
+-    return {'chain': 'sol', 'tx_hash': tx_hash, 'mint': ev['mint'],
+-            'value': ev['value'], 'destination': ev['destination'],
+-            'ata_for': ev['ata_for'], 'authority': ev['authority'],
+-            'block': slot, 'slot': slot, 'block_time': raw.get('blockTime'),
+-            'finality': conf or 'confirmed'}
+diff --git a/backend/ultima_backend/payments/chains/tron.py b/backend/ultima_backend/payments/chains/tron.py
+deleted file mode 100644
+index 4785c64..0000000
+--- a/backend/ultima_backend/payments/chains/tron.py
++++ /dev/null
+@@ -1,68 +0,0 @@
+-# -*- coding: utf-8 -*-
+-"""payments/chains/tron —— TRON TRC-20 原始响应解析（UGP-18）
+-
+-输入 TronGrid 原始响应项（dict），输出归一化链证据字段：
+-{tx_hash, contract, from, to, value(最小单位), block, block_time, confirmed, depth}
+-解析失败抛 ValueError（明确拒绝，不静默跳过）。"""
+-TRC20_TRANSFER_SIG = 'Transfer(address,address,uint256)'
+-
+-_FIELDS = ('transaction_id', 'token_info', 'from', 'to', 'value',
+-           'block_number', 'block_timestamp', 'confirmed', 'contract_address',
+-           'type', 'raw_contract_address')
+-
+-
+-def _norm_addr(a):
+-    return (a or '').strip()
+-
+-
+-def parse_trc20_event(raw, contract_hint=None):
+-    """解析单条 TRC-20 事件。contract_hint 为权威合约地址（资产注册表），用于事件类型确认。
+-    返回归一化 dict；关键字段缺失/非 Transfer 事件 → ValueError。"""
+-    if not isinstance(raw, dict):
+-        raise ValueError('TRON 原始响应必须是对象')
+-    tx_hash = _norm_addr(raw.get('transaction_id'))
+-    if not tx_hash:
+-        raise ValueError('缺少 transaction_id')
+-    contract = _norm_addr(raw.get('contract_address') or
+-                          (raw.get('token_info') or {}).get('address'))
+-    if not contract:
+-        raise ValueError('缺少合约地址')
+-    if raw.get('type') and raw['type'].upper() not in ('TRANSFER', 'TRC20_TRANSFER'):
+-        raise ValueError('非 Transfer 事件: %s' % raw.get('type'))
+-    if contract_hint and contract.lower() != (contract_hint or '').lower():
+-        raise ValueError('合约地址与权威资产不匹配')
+-    raw_value = raw.get('value')
+-    if raw_value is None:
+-        raise ValueError('缺少转账金额')
+-    try:
+-        value = int(raw_value)
+-    except (TypeError, ValueError):
+-        raise ValueError('金额不是整数最小单位: %r' % raw_value)
+-    if value < 0:
+-        raise ValueError('金额为负')
+-    from_ = _norm_addr(raw.get('from'))
+-    to = _norm_addr(raw.get('to'))
+-    if not from_ or not to:
+-        raise ValueError('缺少 from/to')
+-    confirmed = bool(raw.get('confirmed', True))
+-    block = raw.get('block_number')
+-    if block is not None:
+-        try:
+-            block = int(block)
+-        except (TypeError, ValueError):
+-            raise ValueError('block_number 非法')
+-    ts = raw.get('block_timestamp')
+-    if ts is not None:
+-        try:
+-            ts = int(ts)
+-        except (TypeError, ValueError):
+-            raise ValueError('block_timestamp 非法')
+-    depth = raw.get('depth')
+-    if depth is not None:
+-        try:
+-            depth = int(depth)
+-        except (TypeError, ValueError):
+-            raise ValueError('depth 非法')
+-    return {'chain': 'tron', 'tx_hash': tx_hash, 'contract': contract,
+-            'from': from_, 'to': to, 'value': value, 'block': block,
+-            'block_time': ts, 'confirmed': confirmed, 'depth': depth}
+diff --git a/backend/ultima_backend/payments/merchant_api.py b/backend/ultima_backend/payments/merchant_api.py
+deleted file mode 100644
+index eea48d1..0000000
+--- a/backend/ultima_backend/payments/merchant_api.py
++++ /dev/null
+@@ -1,124 +0,0 @@
+-# -*- coding: utf-8 -*-
+-"""
+-payments.merchant_api —— 外部商户支付 API（UGP-30，产品无关）
+-
+-- 商户订单使用商户身份 + 外部订单号 + 外部用户引用；支付核心不要求外部用户存在
+-  Gold users 表，也不硬编码 Gold 套餐（不查 subscription_plans）。
+-- 商户可用链及收款地址按商户自身配置冻结：未配链直接拒绝，绝不悄悄回落平台资金池；
+-  无效商户身份直接拒绝，绝不回落官方商户。
+-- 第三方前端仅拿「短期限、订单作用域」的支付会话（payment_pay_sessions）；
+-  持久商户密钥只存在于商户服务端，不出现在浏览器请求/打包产物。
+-纯逻辑：可注入 db/now，零副作用 import。
+-"""
+-import secrets
+-import sqlite3
+-from datetime import datetime, timedelta
+-
+-from ..contracts import now_iso
+-from . import asset_for_channel
+-
+-SESSION_TTL_MINUTES = 15   # 支付会话短期限（订单作用域）
+-
+-
+-def _merchant_row(db, merchant):
+-    return db.execute('SELECT code, name, enabled, tron_address, eth_address, bsc_address, sol_address'
+-                      ' FROM payment_merchants WHERE code=?', (merchant,)).fetchone()
+-
+-
+-def _merchant_address(row, chain):
+-    """商户自配收款地址；未配 → 返回空（拒绝，不回落平台资金池）。"""
+-    if not row:
+-        return ''
+-    return ((row['tron_address'] or '').strip() if chain == 'TRON' else
+-            (row['eth_address'] or '').strip() if chain == 'ETH' else
+-            (row['bsc_address'] or '').strip() if chain == 'BSC' else
+-            (row['sol_address'] or '').strip() if chain == 'SOL' else '')
+-
+-
+-def create_merchant_intent(db, merchant, external_order_no, external_user_ref,
+-                           amount_units, chain, idempotency_key=None, now=None, ttl_minutes=None):
+-    """外部商户创建支付意图（纯逻辑）：
+-    校验商户有效 → 校验该链已配收款地址（未配拒绝）→ 落订单（金额由商户按最小单位指定）
+-    → 签发短期限、订单作用域支付会话。
+-    返回 (order_row, session_token, None) 或 (None, None, err)。
+-    不依赖 Gold 用户/套餐：username=external_user_ref、plan_id=外部订单引用。"""
+-    now = now_iso() if now is None else now
+-    if not merchant or not external_order_no or not amount_units:
+-        return None, None, '缺少商户标识/外部订单号/金额（最小单位）'
+-    row = _merchant_row(db, merchant)
+-    if not row or not row['enabled']:
+-        return None, None, '无效商户身份，拒绝下单（不回退官方商户）'
+-    if chain not in ('TRON', 'ETH', 'BSC', 'SOL'):
+-        return None, None, '不支持的支付链 %s' % chain
+-    receive = _merchant_address(row, chain)
+-    if not receive:
+-        return None, None, '商户 %s 未配置 %s 链收款地址，通道未开通（不回落平台资金池）' % (merchant, chain)
+-    asset = asset_for_channel(chain)
+-    if not asset:
+-        return None, None, '不支持的支付链 %s（未登记资产/通道停用）' % chain
+-
+-    # 幂等：外部订单号唯一（同单重复 → 返回同一订单与会话，不生成多笔）
+-    if idempotency_key or external_order_no:
+-        hit = db.execute("SELECT * FROM payment_orders WHERE idempotency_key=? ORDER BY id DESC LIMIT 1",
+-                         (idempotency_key or external_order_no,)).fetchone()
+-        if hit:
+-            tok = _issue_session(db, hit['order_no'], merchant, now, ttl_minutes)
+-            return hit, tok, None
+-
+-    asset_key = '%s@%s:%s' % (asset['chain'], asset['network'],
+-                              asset.get('contract') or asset.get('mint'))
+-    order_no = 'MP%s%04d' % (datetime.strptime(now, '%Y-%m-%d %H:%M:%S').strftime('%Y%m%d%H%M%S'),
+-                             secrets.randbelow(10000))
+-    try:
+-        db.execute(
+-            "INSERT INTO payment_orders(order_no, username, plan_id, plan_name, price_usdt, discount,"
+-            " amount_usdt, tail, status, created_at, expired_at, channel, merchant, receive_address,"
+-            " idempotency_key, amount_units, asset_key, allocation_key)"
+-            " VALUES(?,?,?,?,?,?,?,?,'pending',?,?,?,?,?,?,?,?,?)",
+-            (order_no, external_user_ref, external_order_no, '商户商品', 0, 1.0, 0, 0, now,
+-             (datetime.strptime(now, '%Y-%m-%d %H:%M:%S') + timedelta(minutes=ttl_minutes or 30)).strftime('%Y-%m-%d %H:%M:%S'),
+-             chain, merchant, receive, idempotency_key or external_order_no, amount_units, asset_key,
+-             '%s|%s' % (receive, asset_key)))
+-        db.commit()
+-    except sqlite3.IntegrityError:
+-        db.rollback()
+-        hit = db.execute("SELECT * FROM payment_orders WHERE idempotency_key=? ORDER BY id DESC LIMIT 1",
+-                         (idempotency_key or external_order_no,)).fetchone()
+-        if hit:
+-            tok = _issue_session(db, hit['order_no'], merchant, now, ttl_minutes)
+-            return hit, tok, None
+-        return None, None, '并发冲突，请重试'
+-    order = db.execute('SELECT * FROM payment_orders WHERE order_no=?', (order_no,)).fetchone()
+-    tok = _issue_session(db, order_no, merchant, now, ttl_minutes)
+-    return order, tok, None
+-
+-
+-def _issue_session(db, order_no, merchant, now, ttl_minutes=None):
+-    """签发短期限、订单作用域支付会话（session_token 绑定单一订单，过期即失效）。"""
+-    token = 'ps_' + secrets.token_hex(16)
+-    expires = (datetime.strptime(now, '%Y-%m-%d %H:%M:%S')
+-               + timedelta(minutes=ttl_minutes or SESSION_TTL_MINUTES)).strftime('%Y-%m-%d %H:%M:%S')
+-    db.execute('INSERT INTO payment_pay_sessions(session_token, order_no, merchant, expires_at, created_at)'
+-               ' VALUES(?,?,?,?,?)', (token, order_no, merchant, expires, now))
+-    db.commit()
+-    return token
+-
+-
+-def resolve_pay_session(db, session_token, order_no, now=None):
+-    """第三方前端凭支付会话取订单：token 存在、绑定该订单、未过期才放行。
+-    浏览器仅持此会话；持久商户密钥不参与。返回 (order_row, None) 或 (None, err)。"""
+-    now = now_iso() if now is None else now
+-    if not session_token or not order_no:
+-        return None, '缺少支付会话或订单号'
+-    s = db.execute('SELECT order_no, merchant, expires_at FROM payment_pay_sessions WHERE session_token=?',
+-                   (session_token,)).fetchone()
+-    if not s:
+-        return None, '支付会话无效或不存在'
+-    if s['order_no'] != order_no:
+-        return None, '支付会话不属于该订单（订单作用域）'
+-    if s['expires_at'] < now:
+-        return None, '支付会话已过期，请重新下单'
+-    order = db.execute('SELECT * FROM payment_orders WHERE order_no=?', (order_no,)).fetchone()
+-    if not order:
+-        return None, '订单不存在'
+-    return order, None
+diff --git a/backend/ultima_backend/payments/money.py b/backend/ultima_backend/payments/money.py
+deleted file mode 100644
+index 7e7d120..0000000
+--- a/backend/ultima_backend/payments/money.py
++++ /dev/null
+@@ -1,71 +0,0 @@
+-# -*- coding: utf-8 -*-
+-"""
+-payments/money —— UGP-16 金额精度（整数最小单位，纯标准库，无浮点）
+-
+-- 金额内部一律使用整数最小单位（链 decimals 决定的定点单位），不经过浮点。
+-- 十进制字符串 ↔ 最小单位整数：编码→解码恒等；不可精确表示（小数位超过 decimals、
+-  负数、非数字）→ ValueError 明确拒绝，绝不停默截断。
+-- 金融报表 6 位口径与链最小单位分开：报表展示用 report_decimal（定点、显式口径），
+-  与链上最小单位各自独立换算，不混用。
+-"""
+-from decimal import Decimal, InvalidOperation, ROUND_DOWN
+-
+-REPORT_DIGITS = 6   # 金融报表口径：6 位小数（UGP-16 登记）
+-
+-
+-def parse_amount_units(amount_decimal, decimals):
+-    """十进制字符串 → 最小单位整数（int）。
+-    不可精确表示（小数位 > decimals / 负数 / 非数字）→ ValueError（拒绝而非截断）。"""
+-    decimals = int(decimals)
+-    if decimals < 0 or decimals > 30:
+-        raise ValueError('decimals 超出支持范围: %r' % (decimals,))
+-    try:
+-        d = Decimal(str(amount_decimal).strip())
+-    except (InvalidOperation, ValueError, TypeError):
+-        raise ValueError('金额不是合法十进制数: %r' % (amount_decimal,))
+-    if not d.is_finite():
+-        raise ValueError('金额必须是有穷数: %r' % (amount_decimal,))
+-    if d < 0:
+-        raise ValueError('金额不能为负: %r' % (amount_decimal,))
+-    # 小数位检查：超过 decimals 表示无法用该链最小单位精确表示
+-    exp = -d.as_tuple().exponent
+-    if exp > decimals:
+-        raise ValueError('金额 %s 精度超过链最小单位（%d 位），拒绝而非截断' % (amount_decimal, decimals))
+-    units = int(d.scaleb(decimals).to_integral_value())
+-    # 反查恒等：换算回十进制数值必须与输入一致（Decimal 数值比较，防任何舍入路径）
+-    if Decimal(format_amount_units(units, decimals)) != d:
+-        raise ValueError('金额 %s 无法精确表示为 %d 位最小单位' % (amount_decimal, decimals))
+-    return units
+-
+-
+-def format_amount_units(units, decimals):
+-    """最小单位整数 → 十进制字符串（定点、无浮点；保留到链精度位数）。
+-    例：units=1234500, decimals=6 → '1.234500'。"""
+-    units = int(units)
+-    decimals = int(decimals)
+-    if units < 0:
+-        raise ValueError('最小单位不能为负: %r' % (units,))
+-    sign = ''
+-    body = str(units)
+-    if decimals <= 0:
+-        return body
+-    if len(body) <= decimals:
+-        body = '0' * (decimals - len(body) + 1) + body
+-    return sign + body[:-decimals] + '.' + body[-decimals:]
+-
+-
+-def amount_to_report(units, decimals, report_digits=REPORT_DIGITS):
+-    """链最小单位 → 报表 6 位口径（定点四舍五入到 report_digits，明确为展示口径）。
+-    与链最小单位分开：同一金额两种口径各自独立，报表不反写链上精度。"""
+-    dec = Decimal(format_amount_units(units, decimals))
+-    q = Decimal(1).scaleb(-int(report_digits))
+-    return str(dec.quantize(q, rounding=ROUND_DOWN))
+-
+-
+-def roundtrip_ok(amount_decimal, decimals):
+-    """编码→解码恒等校验（测试与运行时自检用）。"""
+-    try:
+-        u = parse_amount_units(amount_decimal, decimals)
+-    except ValueError:
+-        return False
+-    return Decimal(format_amount_units(u, decimals)) == Decimal(str(amount_decimal))
+diff --git a/backend/ultima_backend/payments/orders.py b/backend/ultima_backend/payments/orders.py
+deleted file mode 100644
+index a009b41..0000000
+--- a/backend/ultima_backend/payments/orders.py
++++ /dev/null
+@@ -1,222 +0,0 @@
+-# -*- coding: utf-8 -*-
+-"""
+-payments/orders —— UGP-17 可幂等订单与回执受理（纯逻辑，可注入 db/now，零副作用 import）
+-
+-- 订单由可信会话（principal）和商品标识创建；无效商户 key 必须拒绝，**绝不回退官方站**。
+-- 请求幂等 + 订单状态机：同一幂等键重复/并发/超时重试返回同一订单，不生成多笔待支付
+-  （DB 部分唯一索引 idx_pay_idem 兜底）。
+-- 金额分配：按资产+收款地址+有效窗口分配，活动订单金额唯一（idx_pay_alloc 数据库保证）；
+-  无槽位明确返回忙，不扩大随机尝试伪装成功。
+-- 回执仅提交线索：进入 submitted（待核验）；过期/少付/多付/晚到账/不明确归属 →
+-  可审计异常（exception 队列），不自动发权益。confirmed 仅由链上核验（UGP-03 保持）写入。
+-"""
+-import sqlite3
+-import time
+-import threading
+-from datetime import datetime, timedelta
+-
+-from ..contracts import now_iso
+-from .money import parse_amount_units, format_amount_units
+-from .assets import resolve_asset
+-from . import (
+-    load_payment_channels, read_payment_config, lock_payment_intent,
+-    verify_payment_intent, plan_by_id)
+-
+-# 订单状态机：活动（可匹配到账）→ 待核验 → 已确认；异常/过期为终态（不自动发权益）
+-ACTIVE_STATUS = ('pending', 'submitted', 'confirming')
+-EXCEPTION_STATUS = ('expired', 'cancelled', 'exception')
+-
+-# 金额分配窗口：同一资产+收款地址内并发的活动订单，金额最小单位必须唯一
+-_ALLOC_LOCK = threading.Lock()
+-
+-
+-def _merchant_valid(db, merchant):
+-    """商户有效性：存在且启用。无效商户 key 一律拒绝（调用方不得回退官方站）。"""
+-    if not merchant:
+-        return True   # 平台自有下单（ultima-gold）不走商户凭据
+-    row = db.execute('SELECT code, enabled FROM payment_merchants WHERE code=?', (merchant,)).fetchone()
+-    return bool(row) and bool(row[1])
+-
+-
+-def _receive_for(db, merchant, channel):
+-    """收款地址（UGP-30 隔离）：
+-    - 外部商户（payment_merchants 有记录且非平台自有）：仅允许其自配地址，未配 → 返回空（拒绝，
+-      不悄悄回落平台资金池/官方商户）。
+-    - 平台自有下单（ultima-gold / 无 merchant）：走通道默认地址。
+-    """
+-    receive = ''
+-    _mrow = db.execute('SELECT tron_address, eth_address, bsc_address, sol_address FROM payment_merchants WHERE code=?',
+-                       (merchant,)).fetchone()
+-    if _mrow:
+-        _idx = {'TRON': 0, 'ETH': 1, 'BSC': 2, 'SOL': 3}.get(channel)
+-        if _idx is not None and (_mrow[_idx] or '').strip():
+-            return _mrow[_idx].strip()
+-        # 商户记录存在但未配该链 → 拒绝（不回落平台资金池）
+-        if merchant not in (None, '', 'ultima-gold'):
+-            return ''
+-    if not receive:
+-        receive = (load_payment_channels(db).get(channel) or {}).get('address') or ''
+-    return receive
+-
+-
+-def _activity_hit(db, asset_key, receive, amount_units):
+-    return db.execute(
+-        "SELECT order_no FROM payment_orders"
+-        " WHERE asset_key=? AND receive_address=? AND amount_units=?"
+-        " AND status IN ('pending','submitted','confirming')",
+-        (asset_key, receive, amount_units)).fetchone()
+-
+-
+-def _allocate_amount_units(db, plan, asset, receive, now=None):
+-    """按链/网络/收款地址/有效窗口分配最小单位金额：候选尾数（0.1~0.9 最小单位）逐一查
+-    活动占用；全占 → 返回 (None, '忙')，明确返回忙而非扩大随机伪装成功。
+-    进程锁 + DB 活动唯一索引双保险。"""
+-    decimals = asset['decimals']
+-    try:
+-        price_units = parse_amount_units(str(plan.get('priceUsdt')), decimals)
+-    except ValueError as e:
+-        return None, '套餐价无法用该链最小单位精确表示: %s' % e
+-    unit = 10 ** (decimals - 1)
+-    asset_key = '%s@%s:%s' % (asset['chain'], asset['network'],
+-                              asset.get('contract') or asset.get('mint'))
+-    chosen = None
+-    for tail in (unit * k for k in range(1, 10)):   # 0.1~0.9 最小单位尾数（窗口内候选）
+-        amount_units = price_units + tail
+-        if _activity_hit(db, asset_key, receive, amount_units) is None:
+-            chosen = amount_units
+-            break
+-    if chosen is None:
+-        return None, '该收款地址活动订单金额槽位已满，当前忙，请稍后重试'
+-    return (price_units, chosen, chosen - price_units, asset_key)
+-
+-
+-def create_payment_intent(db, principal, product_ref, chain, idempotency_key,
+-                          plan=None, plan_id=None, merchant=None, receive_address=None,
+-                          now=None, _asset_override=None):
+-    """C3 下单（UGP-17 幂等版）：可信会话 + 商品标识 + 幂等键创建订单。
+-    返回 (order_row, None) 或 (None, err)；同幂等键重复/并发 → 返回同一订单。"""
+-    now = now_iso() if now is None else now
+-    # 1) 可信会话校验：必须能确定下单主体（user 或有效商户）
+-    if not principal or not principal.get('role'):
+-        return None, '缺少可信会话，无法下单'
+-    if principal.get('role') == 'merchant':
+-        if not _merchant_valid(db, principal.get('merchant') or principal.get('username')):
+-            return None, '无效商户 key，拒绝下单（不回退官方商户）'
+-    elif principal.get('role') not in ('user', 'admin'):
+-        return None, '无下单权限'
+-    # 2) 商品解析：plan 或 plan_id（仅套餐权威库）
+-    if plan is None:
+-        plan = plan_by_id(db, plan_id)
+-    if not plan or plan.get('product') != 'tuppoau':
+-        return None, '套餐不存在或非 Ultima Gold 套餐'
+-    # 3~6) 幂等查 + 分配 + 落库 置于进程写锁内（多连接并发写串行，避免 SQLite locked；
+-    #       同幂等键并发由唯一索引兜底 → 重查幂等返回同一订单）
+-    with _ALLOC_LOCK:
+-        if idempotency_key:
+-            hit = db.execute("SELECT * FROM payment_orders WHERE idempotency_key=? ORDER BY id DESC LIMIT 1",
+-                             (idempotency_key,)).fetchone()
+-            if hit:
+-                return hit, None
+-        # 4) 商户归属：无效商户已拒绝；有效商户不能回退官方站
+-        merchant = (merchant or '').strip() or 'ultima-gold'
+-        receive = receive_address or _receive_for(db, merchant, chain)
+-        if not receive:
+-            return None, '%s 链收款地址未配置，通道暂未开通' % chain
+-        # 5) 金额分配（最小单位唯一；无槽位 → 忙）
+-        asset = _asset_override
+-        if asset is None:
+-            from . import asset_for_channel
+-            asset = asset_for_channel(chain)
+-        if not asset:
+-            return None, '不支持的支付链 %s（未登记资产/通道停用）' % chain
+-        got = _allocate_amount_units(db, plan, asset, receive, now)
+-        if got[0] is None:
+-            return None, got[1]
+-        price_units, amount_units, tail_units, asset_key = got
+-        # 6) 落库（含幂等键/最小单位/资产键）；并发冲突由唯一索引兜底 → 重查幂等或返回忙
+-        while True:
+-            order_no = 'PAY%s%04d' % (datetime.now().strftime('%Y%m%d%H%M%S'),
+-                                      int(time.time() * 1000) % 10000)
+-            if not db.execute('SELECT id FROM payment_orders WHERE order_no=?', (order_no,)).fetchone():
+-                break
+-        try:
+-            db.execute(
+-                "INSERT INTO payment_orders(order_no, username, plan_id, plan_name, price_usdt, discount,"
+-                " amount_usdt, tail, status, created_at, expired_at, channel, merchant, receive_address,"
+-                " idempotency_key, amount_units, asset_key, allocation_key)"
+-                " VALUES(?,?,?,?,?,?,?,?,'pending',?,?,?,?,?,?,?,?,?)",
+-                (order_no, principal.get('username') or principal.get('merchant') or '',
+-                 plan.get('id'), plan.get('name'), float(format_amount_units(price_units, asset['decimals'])),
+-                 plan.get('discount'), float(format_amount_units(amount_units, asset['decimals'])),
+-                 float(format_amount_units(tail_units, asset['decimals'])), now,
+-                 _expire_at(db, now), chain, merchant, receive,
+-                 idempotency_key or None, amount_units, asset_key, '%s|%s' % (receive, asset_key)))
+-            db.commit()
+-        except sqlite3.IntegrityError:
+-            db.rollback()
+-            if idempotency_key:
+-                hit = db.execute("SELECT * FROM payment_orders WHERE idempotency_key=? ORDER BY id DESC LIMIT 1",
+-                                 (idempotency_key,)).fetchone()
+-                if hit:
+-                    return hit, None
+-            return None, '金额分配并发冲突，请重试'
+-    return db.execute('SELECT * FROM payment_orders WHERE order_no=?', (order_no,)).fetchone(), None
+-
+-
+-def _row_map(cursor):
+-    cols = [d[0] for d in cursor.description]
+-    return lambda r: dict(zip(cols, r))
+-
+-
+-def _expire_at(db, now=None):
+-    cfg = read_payment_config(db)
+-    ttl = int(cfg.get('ttlMinutes') or 30)
+-    return (datetime.strptime(now, '%Y-%m-%d %H:%M:%S') + timedelta(minutes=ttl)).strftime('%Y-%m-%d %H:%M:%S')
+-
+-
+-def _audit_exception(db, order_no, reason, tx_hash='', now=None):
+-    """可审计异常登记：过期/少付/多付/晚到账/不明确归属落 exception 队列，不自动发权益。"""
+-    now = now_iso() if now is None else now
+-    db.execute("INSERT INTO payment_order_exceptions(order_no, reason, tx_hash, created_at)"
+-               " VALUES(?,?,?,?)", (order_no, reason, tx_hash or '', now))
+-    db.execute("UPDATE payment_orders SET status='exception' WHERE order_no=?", (order_no,))
+-    db.commit()
+-
+-
+-def submit_receipt(db, order_no, tx_hash, amount_units=None, now=None):
+-    """回执受理（仅提交线索）：pending → submitted（待核验队列）。
+-    过期/少付/多付/晚到账/不明确归属 → exception（可审计），不自动发权益。"""
+-    now = now_iso() if now is None else now
+-    cur = db.execute('SELECT * FROM payment_orders WHERE order_no=?', (order_no,))
+-    row = cur.fetchone()
+-    if not row:
+-        return None, '订单不存在'
+-    m = _row_map(cur)(row)
+-    status = m['status']
+-    if status in ('confirmed', 'submitted', 'confirming'):
+-        return None, '订单已进入核验/确认，回执重复提交无效'
+-    if status in EXCEPTION_STATUS:
+-        _audit_exception(db, order_no, '订单已处于终态 %s，晚到账/重复回执' % status, tx_hash, now)
+-        return None, '订单已失效/异常，晚到账不自动发权益'
+-    # 金额核对（最小单位）：少付/多付 → 可审计异常
+-    expect_units = m.get('amount_units')
+-    if expect_units is not None and amount_units is not None and amount_units != expect_units:
+-        _audit_exception(db, order_no, '金额不匹配：订单 %d，到账 %d' % (expect_units, amount_units), tx_hash, now)
+-        return None, '金额不匹配，进入可审计异常'
+-    if amount_units is None:
+-        _audit_exception(db, order_no, '回执缺少金额，归属不明确', tx_hash, now)
+-        return None, '缺少金额，归属不明确'
+-    # 通过：仅提交线索（不自动 confirmed / 不发权益；链上核验另行流转）
+-    db.execute("UPDATE payment_orders SET status='submitted', tx_hash=?, paid_at=?, source='test'"
+-               " WHERE order_no=?", (tx_hash or '', now, order_no))
+-    db.commit()
+-    return db.execute('SELECT * FROM payment_orders WHERE order_no=?', (order_no,)).fetchone(), None
+-
+-
+-def expire_stale_orders(db, now=None):
+-    """活动订单超时未到账 → expired（金额槽位释放，可被新订单复用）。"""
+-    now = now_iso() if now is None else now
+-    cur = db.execute("UPDATE payment_orders SET status='expired'"
+-                     " WHERE status='pending' AND expired_at < ?", (now,))
+-    db.commit()
+-    return cur.rowcount
+diff --git a/backend/ultima_backend/payments/outbox.py b/backend/ultima_backend/payments/outbox.py
+deleted file mode 100644
+index b362211..0000000
+--- a/backend/ultima_backend/payments/outbox.py
++++ /dev/null
+@@ -1,89 +0,0 @@
+-# -*- coding: utf-8 -*-
+-"""payments/outbox —— 待办事件 outbox（UGP-19）
+-
+-- enqueue_event：入队（同订单同事件类型唯一 → 幂等重放不重复入队）；event_id 唯一（出站回调幂等键）。
+-- claim_events：领取到期待投递事件（有界批次；失败退避 next_retry_at 到期才可重领）。
+-- mark_delivered / mark_failed：投递结果回写；失败有界重试（attempts 超 max → dead 死信队列）。
+-网络回调（投递动作）由 callbacks 模块执行，不得夹在落账数据库事务中。
+-"""
+-import json
+-import uuid
+-from datetime import datetime, timedelta
+-
+-EVENT_VERIFIED = 'payment.verified'
+-
+-_RETRY_BASE_SEC = 10
+-
+-
+-def _now_iso(now=None):
+-    return (now or datetime.now()).strftime('%Y-%m-%d %H:%M:%S')
+-
+-
+-def _fmt_dt(dt):
+-    return dt.strftime('%Y-%m-%d %H:%M:%S')
+-
+-
+-def enqueue_event(db, order_no, event_type, payload, now=None):
+-    """入队事件（幂等：同订单同事件类型已存在 → 返回已有事件不重复入队）。
+-    payload 为 dict（JSON 序列化存储）。返回 {event_id, order_no, event_type, status}。"""
+-    now = now or datetime.now()
+-    payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+-    row = db.execute('SELECT event_id, status FROM payment_events '
+-                     'WHERE order_no=? AND event_type=?', (order_no, event_type)).fetchone()
+-    if row:
+-        return {'event_id': row[0], 'order_no': order_no, 'event_type': event_type,
+-                'status': row[1], 'duplicate': True}
+-    event_id = 'evt_' + uuid.uuid4().hex
+-    db.execute('INSERT INTO payment_events(event_id, order_no, event_type, payload, status, '
+-               'attempts, max_attempts, next_retry_at, last_error, created_at) '
+-               'VALUES(?,?,?,?,?,?,?,?,?,?)',
+-               (event_id, order_no, event_type, payload_json, 'pending', 0,
+-                8, _fmt_dt(now), None, _fmt_dt(now)))
+-    return {'event_id': event_id, 'order_no': order_no, 'event_type': event_type,
+-            'status': 'pending', 'duplicate': False}
+-
+-
+-def claim_events(db, batch=10, now=None):
+-    """领取到期待投递事件（pending 或 failed 且 next_retry_at<=now、attempts<max）。
+-    返回 [{id, event_id, order_no, event_type, payload, attempts}]；无到期项返回空。"""
+-    now = now or datetime.now()
+-    rows = db.execute(
+-        "SELECT id, event_id, order_no, event_type, payload, attempts FROM payment_events "
+-        "WHERE status IN ('pending','failed') AND (next_retry_at IS NULL OR next_retry_at <= ?) "
+-        "AND attempts < max_attempts ORDER BY id LIMIT ?",
+-        (_fmt_dt(now), batch)).fetchall()
+-    out = []
+-    for r in rows:
+-        try:
+-            payload = json.loads(r[4])
+-        except (TypeError, ValueError):
+-            payload = {}
+-        out.append({'id': r[0], 'event_id': r[1], 'order_no': r[2],
+-                    'event_type': r[3], 'payload': payload, 'attempts': r[5]})
+-    return out
+-
+-
+-def mark_delivered(db, event_id, now=None):
+-    db.execute("UPDATE payment_events SET status='delivered', delivered_at=?, last_error=NULL "
+-               "WHERE event_id=?", (_fmt_dt(now or datetime.now()), event_id))
+-    db.commit()
+-    return True
+-
+-
+-def mark_failed(db, event_id, error, now=None, max_attempts=None):
+-    """投递失败：attempts+1；next_retry_at 指数退避（10s * 2^(attempts-1)）；超 max → dead 死信。"""
+-    now = now or datetime.now()
+-    row = db.execute('SELECT attempts, max_attempts FROM payment_events WHERE event_id=?',
+-                     (event_id,)).fetchone()
+-    attempts = (row[0] if row else 0) + 1
+-    cap = max_attempts if max_attempts is not None else (row[1] if row else 8)
+-    if attempts >= cap:
+-        db.execute("UPDATE payment_events SET status='dead', attempts=?, last_error=? WHERE event_id=?",
+-                   (attempts, '%s' % error, event_id))
+-    else:
+-        delay = _RETRY_BASE_SEC * (2 ** (attempts - 1))
+-        retry_at = now + timedelta(seconds=delay)
+-        db.execute("UPDATE payment_events SET status='failed', attempts=?, last_error=?, next_retry_at=? "
+-                   "WHERE event_id=?", (attempts, '%s' % error, _fmt_dt(retry_at), event_id))
+-    db.commit()
+-    return attempts
+diff --git a/backend/ultima_backend/payments/reconciliation.py b/backend/ultima_backend/payments/reconciliation.py
+deleted file mode 100644
+index ed6d850..0000000
+--- a/backend/ultima_backend/payments/reconciliation.py
++++ /dev/null
+@@ -1,168 +0,0 @@
+-# -*- coding: utf-8 -*-
+-"""
+-payments.reconciliation —— 只读对账与异常分类（UGP-29）
+-
+-- 输入：链上到账证据（payment_ledger：order_no/tx_hash/chain/network/asset_key/amount_units）、
+-  支付流水（payment_orders）、权益履约（fulfillment_log）、可靠事件（payment_events）。
+-- 最小单位精确对账：amount_units（整数最小单位）逐订单与证据合计比对，diff=0 才 matched。
+-- 异常分类（每个异常 fixture 落入预期分类，不隐藏）：
+-  stale（订单过期/取消）、legacy（历史未核验记录，不计入真实收入与通过率）、
+-  unverified（无链证据）、underpaid / overpaid（少付/多付）、
+-  pending_fulfillment（已核验已到账但权益未履约）、callback_failed（回执回调失败）、unknown（保持待处理）。
+-- 只读零副作用：本模块不执行任何写操作（INSERT/UPDATE/DELETE）；测试以 query_only 连接运行验证。
+-- 后台修正操作需授权、理由与前后值（修正类写操作不属于本模块；对外退款/补偿需另列资金授权）。
+-"""
+-import json
+-from datetime import datetime
+-
+-LEGACY_SOURCES = ('legacy', 'legacy_unverified', 'test')
+-# 允许链/网络/币种作为对账维度标签（USDT 最小单位由 amount_units 整数承载，不做隐式换算）
+-
+-
+-def _now(now_fn):
+-    return now_fn() if now_fn else datetime.now()
+-
+-
+-def _evidence_map(db):
+-    """按订单聚合链上到账证据（最小单位）。"""
+-    rows = db.execute('SELECT order_no, tx_hash, chain, network, asset_key, amount_units, block,'
+-                      ' block_time, evidence_id, event_id, created_at FROM payment_ledger').fetchall()
+-    out = {}
+-    for r in rows:
+-        o = out.setdefault(r['order_no'], [])
+-        o.append({'tx_hash': r['tx_hash'], 'chain': r['chain'], 'network': r['network'],
+-                  'asset_key': r['asset_key'], 'amount_units': r['amount_units'],
+-                  'block': r['block'], 'block_time': r['block_time'],
+-                  'evidence_id': r['evidence_id'], 'event_id': r['event_id'],
+-                  'created_at': r['created_at']})
+-    return out
+-
+-
+-def _fulfilled_orders(db):
+-    return {r['order_no'] for r in db.execute(
+-        "SELECT order_no FROM fulfillment_log WHERE status='applied'")}
+-
+-
+-def _callback_failed(db):
+-    return {r['order_no'] for r in db.execute(
+-        "SELECT order_no FROM payment_orders WHERE status='confirmed' AND callback_status='failed'")}
+-
+-
+-def _fmt_amount_units(units, asset_key):
+-    return '%d (%s)' % (units or 0, asset_key or '?')
+-
+-
+-def run_reconciliation(db, now_fn=None):
+-    """只读对账。返回报告 dict（不写库）。"""
+-    now = _now(now_fn)
+-    evidence = _evidence_map(db)
+-    fulfilled = _fulfilled_orders(db)
+-    callback_failed = _callback_failed(db)
+-
+-    orders = db.execute('SELECT order_no, username, plan_id, amount_units, amount_usdt, status,'
+-                        ' source, tx_hash, callback_status, idempotency_key, created_at'
+-                        ' FROM payment_orders ORDER BY id').fetchall()
+-
+-    categories = {}
+-    live_income = {}
+-    exceptions = []
+-    matched_live = 0
+-    abnormal_live = 0
+-
+-    def bump(cls):
+-        categories[cls] = categories.get(cls, 0) + 1
+-
+-    for o in orders:
+-        order_no = o['order_no']
+-        evs = evidence.get(order_no, [])
+-        is_legacy = (o['source'] or '') in LEGACY_SOURCES or o['amount_units'] is None
+-
+-        # 1) 历史未核验记录：legacy（不计入真实收入/通过率；不把历史模拟核销当真实到账）
+-        if is_legacy:
+-            bump('legacy')
+-            exceptions.append({'order_no': order_no, 'cls': 'legacy', 'reason': 'legacy-unverified',
+-                               'detail': 'source=%s state=%s tx=%s evidence=%d' % (
+-                                   o['source'], o['status'], o['tx_hash'] or '', len(evs))})
+-            continue
+-
+-        # 2) 过期/取消订单：stale（不参与收入）
+-        if o['status'] == 'expired':
+-            bump('stale')
+-            exceptions.append({'order_no': order_no, 'cls': 'stale', 'reason': 'order-expired',
+-                               'detail': 'amount_units=%s' % _fmt_amount_units(o['amount_units'], 'USDT')})
+-            continue
+-
+-        # 3) 无链证据 → 未核验
+-        if not evs:
+-            bump('unverified')
+-            abnormal_live += 1
+-            exceptions.append({'order_no': order_no, 'cls': 'unverified', 'reason': 'no-chain-evidence',
+-                               'detail': 'status=%s tx=%s' % (o['status'], o['tx_hash'] or '')})
+-            continue
+-
+-        # 4) 最小单位金额核对（按资产键分组）
+-        by_asset = {}
+-        for e in evs:
+-            key = e['asset_key'] or '?'
+-            by_asset.setdefault(key, 0)
+-            by_asset[key] = (by_asset[key] or 0) + (e['amount_units'] or 0)
+-        order_units = o['amount_units'] or 0
+-        asset_key = list(by_asset.keys())[0] if by_asset else '?'
+-        recv = by_asset.get(asset_key, 0)
+-        diff = recv - order_units
+-        if diff < 0:
+-            bump('underpaid')
+-            abnormal_live += 1
+-            exceptions.append({'order_no': order_no, 'cls': 'underpaid', 'reason': 'amount-diff<0',
+-                               'detail': 'order=%d recv=%d diff=%d %s' % (
+-                                   order_units, recv, diff, asset_key)})
+-            continue
+-        if diff > 0:
+-            bump('overpaid')
+-            abnormal_live += 1
+-            exceptions.append({'order_no': order_no, 'cls': 'overpaid', 'reason': 'amount-diff>0',
+-                               'detail': 'order=%d recv=%d diff=%d %s' % (
+-                                   order_units, recv, diff, asset_key)})
+-            continue
+-
+-        # 5) 金额匹配：核验权益履约
+-        if order_no not in fulfilled:
+-            bump('pending_fulfillment')
+-            abnormal_live += 1
+-            exceptions.append({'order_no': order_no, 'cls': 'pending_fulfillment',
+-                               'reason': 'fulfillment-not-applied',
+-                               'detail': 'amount=%d %s evidence=%d' % (order_units, asset_key, len(evs))})
+-            continue
+-
+-        # 6) 正常 matched（真实收入）
+-        bump('matched')
+-        matched_live += 1
+-        live_income[asset_key] = live_income.get(asset_key, 0) + order_units
+-        if order_no in callback_failed:
+-            # 到账与权益正常，但对外回执回调失败 → 附随异常（不隐藏）
+-            bump('callback_failed')
+-            exceptions.append({'order_no': order_no, 'cls': 'callback_failed',
+-                               'reason': 'callback-delivery-failed',
+-                               'detail': 'amount=%d %s' % (order_units, asset_key)})
+-
+-    live_total = matched_live + abnormal_live
+-    return {
+-        'generated_at': now.isoformat() if not isinstance(now, str) else now,
+-        'scope': {
+-            'order_total': len(orders),
+-            'matched_live': matched_live,
+-            'abnormal_live': abnormal_live,
+-            'legacy': categories.get('legacy', 0),
+-            'stale': categories.get('stale', 0),
+-        },
+-        'live_income_by_asset': live_income,
+-        'live_success_rate': round(matched_live / live_total, 4) if live_total else None,
+-        'categories': categories,
+-        'exceptions': exceptions,
+-        'readonly': True,
+-    }
+-
+-
+-def render_report(report):
+-    """渲染报告为 JSON 字符串（scripts/reconcile.py 使用；只读）。"""
+-    return json.dumps(report, ensure_ascii=False, indent=2)
+diff --git a/backend/ultima_backend/payments/settlement.py b/backend/ultima_backend/payments/settlement.py
+deleted file mode 100644
+index d60749f..0000000
+--- a/backend/ultima_backend/payments/settlement.py
++++ /dev/null
+@@ -1,71 +0,0 @@
+-# -*- coding: utf-8 -*-
+-"""payments/settlement —— 落账（UGP-19）
+-
+-record_verified_payment(db, order_no, evidence)：
+-- 同事务记录链证据（payment_ledger，tx_hash 唯一约束）、支付确认（payment_orders → confirmed）、
+-  待履约事件（payment_events outbox 入队 PaymentVerified）；
+-- 幂等重放：同一 tx_hash/证据已入账 → 直接返回已存在记录，不重复入账/重复入队；
+-- 网络回调（投递）不得夹在本事务内——入队后 commit，投递由 callbacks.deliver_callbacks 独立执行。
+-链事件唯一约束绑定网络/交易/事件：tx_hash 唯一（复用原 tx_hash 幂等要求）。
+-"""
+-import json
+-from datetime import datetime
+-
+-from .outbox import enqueue_event, EVENT_VERIFIED
+-
+-
+-def _now_iso(now=None):
+-    return (now or datetime.now()).strftime('%Y-%m-%d %H:%M:%S')
+-
+-
+-def _evidence_payload(evidence):
+-    """ChainEvidence → payload dict（事件载荷；含 event 语义字段）。"""
+-    return {'order_no': evidence.order_no, 'tx_hash': evidence.tx_hash,
+-            'chain': evidence.chain, 'network': evidence.network,
+-            'asset_key': evidence.asset_key, 'amount_units': evidence.amount_units,
+-            'block': evidence.block, 'block_time': evidence.block_time,
+-            'confirmations': evidence.confirmations, 'finality': evidence.finality}
+-
+-
+-def record_verified_payment(db, order_no, evidence, callback_url=None, now=None):
+-    """原子落账＋PaymentVerified 事件。返回 (result, reason)：
+-    result='recorded'（新入账）/ 'duplicate'（幂等重放，未新增）/ 'order_not_found' / 'state_not_active'。"""
+-    now = now or datetime.now()
+-    # 幂等：同一 tx_hash 已入账 → 不重复入账、不重复事件
+-    dup = db.execute('SELECT id FROM payment_ledger WHERE tx_hash=?', (evidence.tx_hash,)).fetchone()
+-    if dup:
+-        return 'duplicate', '链事件已入账（tx_hash 幂等）'
+-    row = db.execute("SELECT status FROM payment_orders WHERE order_no=?",
+-                     (order_no,)).fetchone()
+-    if not row:
+-        return 'order_not_found', '订单不存在'
+-    if row[0] not in ('pending', 'submitted', 'confirming'):
+-        return 'state_not_active', '订单不在活动态（%s）' % row[0]
+-    payload = _evidence_payload(evidence)
+-    if callback_url:
+-        payload['callback_url'] = callback_url
+-    db.execute('BEGIN')
+-    try:
+-        db.execute("INSERT INTO payment_ledger(order_no, tx_hash, chain, network, asset_key, "
+-                   "amount_units, block, block_time, evidence_id, event_id, created_at) "
+-                   "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+-                   (order_no, evidence.tx_hash, evidence.chain, evidence.network,
+-                    evidence.asset_key, evidence.amount_units, evidence.block,
+-                    evidence.block_time, getattr(evidence, 'evidence_id', None),
+-                    None, _now_iso(now)))
+-        db.execute("UPDATE payment_orders SET status='confirmed', tx_hash=?, confirmed_at=?, source='live' "
+-                   "WHERE order_no=?", (evidence.tx_hash, _now_iso(now), order_no))
+-        ev = enqueue_event(db, order_no, EVENT_VERIFIED, payload, now=now)
+-        if ev['duplicate']:
+-            db.rollback()
+-            return 'duplicate', '事件已入队（幂等）'
+-        db.execute('UPDATE payment_ledger SET event_id=? WHERE tx_hash=?',
+-                   (ev['event_id'], evidence.tx_hash))
+-        db.commit()
+-    except Exception:
+-        try:
+-            db.rollback()
+-        except Exception:
+-            pass
+-        raise
+-    return 'recorded', ev['event_id']
+diff --git a/backend/ultima_backend/payments/verification.py b/backend/ultima_backend/payments/verification.py
+deleted file mode 100644
+index ef7de0d..0000000
+--- a/backend/ultima_backend/payments/verification.py
++++ /dev/null
+@@ -1,187 +0,0 @@
+-# -*- coding: utf-8 -*-
+-"""payments/verification —— UGP-18 服务端链上真实性核验（纯逻辑，fixture/回放驱动）
+-
+-verify_receipt(intent, chain, provider_result, db=None, tracker=None, now=None)
+-→ (ChainEvidence|None, status, reason)
+-
+-- status: confirmed / pending（待更多确认）/ rejected（明确拒绝）/ unknown（RPC 结果不可信）。
+-- 硬核对（wrong_asset_chain_recipient_or_amount_denied）：
+-  资产（contract/mint 与权威注册表一致，同名伪资产拒绝）、链/网络、收款方（to/ATA 归属）、
+-  精确金额（最小单位整数相等，非浮点模糊）、交易成功状态、订单时间窗、交易事件唯一性。
+-- 确认门（confirmation_gate_and_reorg）：
+-  深度 TRON≥19 / EVM≥12（provider depth/confirmations），SOL 按最终性；
+-  连续确认 ≥4 轮，每轮必须是有间隔的新观察（block 前进、时间前进）；
+-  block 回退/重组 → 撤回候选（重置）；RPC timeout/null/失败/未知结果不得推进成功。
+-"""
+-from .assets import resolve_asset
+-from .chains import tron as tron_chain
+-from .chains import evm as evm_chain
+-from .chains import solana as solana_chain
+-
+-CONFIRMATION_ROUNDS = 4
+-DEPTH_MIN = {'tron': 19, 'eth': 12, 'bsc': 12, 'sol': 0}   # SOL 按最终性（finality 字段）
+-CLOCK_SKEW_TOLERANCE = 60   # 交易时间早于订单创建可容忍秒数（时钟偏差）
+-
+-
+-class ChainEvidence(object):
+-    """C4 ChainEvidence：服务端验证产生的可信证据（仅此可推进到账状态）。"""
+-
+-    def __init__(self, order_no, tx_hash, chain, network, asset_key, amount_units,
+-                 from_addr, to_addr, block, block_time, confirmations, finality):
+-        self.order_no = order_no
+-        self.tx_hash = tx_hash
+-        self.chain = chain
+-        self.network = network
+-        self.asset_key = asset_key
+-        self.amount_units = amount_units
+-        self.from_addr = from_addr
+-        self.to_addr = to_addr
+-        self.block = block
+-        self.block_time = block_time
+-        self.confirmations = confirmations
+-        self.finality = finality
+-
+-    def to_dict(self):
+-        return {k: v for k, v in self.__dict__.items()}
+-
+-
+-class ConfirmationTracker(object):
+-    """连续确认轮次状态机：保存区块标识识别重组/回退；有间隔的新观察累计 ≥4 轮 → confirmed。
+-    - observe(block_ref, ts)：block_ref 回退（< 上次）→ 撤回重置；ts 未前进 → 不算新轮。
+-    - confirmed()：累计轮次 ≥ rounds 且无回退。"""
+-
+-    def __init__(self, rounds=CONFIRMATION_ROUNDS):
+-        self.rounds = rounds
+-        self._obs = []   # [(block_ref, ts)]
+-
+-    def observe(self, block_ref, ts=None):
+-        if self._obs:
+-            last_ref, last_ts = self._obs[-1]
+-            if block_ref is None:
+-                return len(self._obs)
+-            if last_ref is not None and block_ref < last_ref:
+-                self._obs = []          # 重组/回退 → 撤回候选
+-                return 0
+-            if ts is not None and last_ts is not None and ts <= last_ts:
+-                return len(self._obs)   # 非新观察（无间隔/时间未前进）
+-        self._obs.append((block_ref, ts))
+-        return len(self._obs)
+-
+-    @property
+-    def count(self):
+-        return len(self._obs)
+-
+-    def confirmed(self):
+-        return len(self._obs) >= self.rounds
+-
+-    def reset(self):
+-        self._obs = []
+-
+-
+-def _parse_provider(chain, provider_result, asset):
+-    """逐链解析原始响应 → 归一化证据 dict；解析失败抛 ValueError（明确拒绝）。"""
+-    if chain == 'tron':
+-        return tron_chain.parse_trc20_event(provider_result,
+-                                            contract_hint=asset.get('contract'))
+-    if chain in ('eth', 'bsc', 'evm'):
+-        return evm_chain.parse_evm_log(provider_result,
+-                                       contract_hint=asset.get('contract'), chain=chain)
+-    if chain == 'sol':
+-        return solana_chain.parse_solana_tx(provider_result, mint_hint=asset.get('mint'))
+-    raise ValueError('不支持的链 %s' % chain)
+-
+-
+-def _normalize_asset(intent, chain):
+-    """按 chain+network+contract/mint 定位权威资产；定位失败 → 拒绝。"""
+-    contract_or_mint = None
+-    if chain in ('eth', 'bsc', 'tron'):
+-        contract_or_mint = intent.get('contract') or intent.get('asset_key', '').split(':', 1)[-1]
+-    elif chain == 'sol':
+-        contract_or_mint = intent.get('mint') or intent.get('asset_key', '').split(':', 1)[-1]
+-    network = intent.get('network') or 'mainnet'
+-    asset = resolve_asset(chain, network, contract_or_mint)
+-    if asset is None:
+-        raise ValueError('链/网络/资产未登记（资产键 %s）' % (intent.get('asset_key') or contract_or_mint))
+-    return asset
+-
+-
+-def _unique_event_ok(db, order_no, tx_hash, amount_units):
+-    """交易事件唯一性：同 tx_hash 已绑定其他订单 → 拒绝（重复证明不得跨订单复用）。"""
+-    if db is None:
+-        return True
+-    row = db.execute(
+-        "SELECT order_no FROM payment_orders WHERE tx_hash=? AND order_no != ? LIMIT 1",
+-        (tx_hash, order_no)).fetchone()
+-    return row is None
+-
+-
+-def verify_receipt(intent, chain, provider_result, db=None, tracker=None, now=None):
+-    """服务端核验：硬核对 → 深度门 → 连续确认轮次 → ChainEvidence。
+-    tracker 为 None 时新建（单次观察不确认）；每次调用累计一次新观察。"""
+-    order_no = intent.get('order_no')
+-    if not order_no:
+-        return None, 'rejected', '缺少订单号'
+-    try:
+-        asset = _normalize_asset(intent, chain)
+-        evidence = _parse_provider(chain, provider_result, asset)
+-    except ValueError as e:
+-        return None, 'rejected', '%s' % e
+-    # 1) 资产/链/网络核对
+-    expected_contract = (asset.get('contract') or asset.get('mint') or '').lower()
+-    actual_contract = (evidence.get('contract') or evidence.get('mint') or '').lower()
+-    if actual_contract != expected_contract:
+-        return None, 'rejected', '资产不匹配（同名伪资产）'
+-    if evidence['chain'] not in (chain, 'evm' if chain in ('eth', 'bsc') else chain):
+-        return None, 'rejected', '链不匹配'
+-    # 2) 收款方核对（to 精确；SOL 校验 ATA 归属收款方）
+-    receive = (intent.get('receive_address') or '').lower()
+-    to = (evidence.get('to') or '').lower()
+-    if chain == 'sol':
+-        ata_for = (evidence.get('ata_for') or '').lower()
+-        if not ata_for or ata_for != receive:
+-            return None, 'rejected', '收款地址不匹配（ATA 归属非订单收款方）'
+-    elif not to or to != receive:
+-        return None, 'rejected', '收款地址不匹配'
+-    # 3) 精确金额核对（最小单位整数相等）
+-    amount_units = intent.get('amount_units')
+-    if amount_units is None or int(evidence.get('value', -1)) != int(amount_units):
+-        return None, 'rejected', '金额不匹配（精确最小单位）'
+-    # 4) 交易成功状态（解析器已拒绝失败交易；此处确认标志核对）
+-    if evidence.get('confirmed') is False:
+-        return None, 'rejected', '交易未确认/失败'
+-    if chain == 'sol' and evidence.get('finality') not in ('confirmed', 'finalized'):
+-        return None, 'rejected', 'SOL 交易最终性不足'
+-    # 5) 订单时间窗：交易不得早于订单创建（容忍时钟偏差），也不得超出订单窗口
+-    created = intent.get('created_at')
+-    bt = evidence.get('block_time')
+-    if created and bt is not None:
+-        try:
+-            import datetime
+-            created_ts = datetime.datetime.strptime(created[:19], '%Y-%m-%d %H:%M:%S').timestamp()
+-        except ValueError:
+-            created_ts = None
+-        if created_ts is not None and bt < created_ts - CLOCK_SKEW_TOLERANCE:
+-            return None, 'rejected', '交易早于订单创建（时间窗不匹配）'
+-    # 6) 交易事件唯一性
+-    tx_hash = evidence.get('tx_hash')
+-    if not _unique_event_ok(db, order_no, tx_hash, amount_units):
+-        return None, 'rejected', '交易事件已绑定其他订单'
+-    # 7) 深度门（TRON≥19 / EVM≥12；SOL 按最终性已核）
+-    depth = evidence.get('depth')
+-    if chain in DEPTH_MIN and DEPTH_MIN[chain] > 0:
+-        if depth is None:
+-            return None, 'pending', '深度不足：缺少确认深度（%s≥%d）' % (chain, DEPTH_MIN[chain])
+-        if depth < DEPTH_MIN[chain]:
+-            return None, 'pending', '深度不足：%d < %d' % (depth, DEPTH_MIN[chain])
+-    # 8) 连续确认轮次（有间隔新观察；重组撤回）
+-    tracker = tracker or ConfirmationTracker()
+-    n = tracker.observe(evidence.get('block'), bt)
+-    if not tracker.confirmed():
+-        return None, 'pending', '连续确认不足：%d/%d 轮' % (n, CONFIRMATION_ROUNDS)
+-    finality = 'confirmed' if tracker.confirmed() else 'pending'
+-    ev = ChainEvidence(order_no, tx_hash, chain, intent.get('network') or 'mainnet',
+-                       asset['chain'] + '@' + asset['network'] + ':' + expected_contract,
+-                       int(amount_units), evidence.get('from'), evidence.get('to') or evidence.get('ata_for'),
+-                       evidence.get('block'), evidence.get('block_time'),
+-                       tracker.count, finality)
+-    return ev, 'confirmed', '服务端链上核验通过（%d 轮连续确认）' % tracker.count
+
