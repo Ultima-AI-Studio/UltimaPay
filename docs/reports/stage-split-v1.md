@@ -17,7 +17,7 @@
 | Gate | 状态 | 证据 |
 |---|---|---|
 | T0 | PASS | `evidence/split-v1/t0-gate.txt`：独立环境依赖导入通过；pytest 1/1；Gold 8912 未启动时真实 8061 `/health`=200 |
-| T1 | 未开始 | — |
+| T1 | PASS | `evidence/split-v1/t1-gate.txt`：完整 14 文件迁移；AST 函数签名等价；pytest 3/3；冷库基础表 10/10；禁词仅兼容常量层 1 处 |
 | T2 | 未开始 | — |
 | T3 | 未开始 | — |
 | T4 | 未开始 | — |

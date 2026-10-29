@@ -1,0 +1,33 @@
+Gate T1 evidence — 2026-10-29 Asia/Shanghai
+
+RULING
+The source directory contains 14 Python files, not only the three files named in the task summary.
+All 14 payment files and chain adapters were migrated because the named modules directly import them
+and the work order requires the complete payments package with zero functional loss.
+
+RED
+Command: cd backend && .venv/Scripts/python.exe -m pytest tests/test_t1_payments.py -q
+Result: exit 1; 3 failed for missing app.payments/app.compat.
+
+GREEN
+Command: cd backend && .venv/Scripts/python.exe -m pytest tests/test_t1_payments.py -q
+Result: exit 0; 3 passed in 0.27s.
+Covered: exact channel values; amount lock and tail bounds; tamper rejection; idempotent order;
+receipt transitions only to submitted with source=test.
+
+PACKAGE EQUIVALENCE
+Source Python files: 14.
+Missing target files: none.
+AST function names, positional argument names, and default counts: EQUIVALENT for every source file.
+All target payment modules and TRON/EVM/Solana adapters: IMPORT_PASS.
+Only necessary changes: package imports, independent catalog/auth/storage dependencies, logger namespace,
+and mechanical replacement of the persisted old product slug by app.compat.LEGACY_PRODUCT_REF.
+
+COLD BASE DATABASE
+Disposable SQLite DB: 10/10 required payment/base tables, 4 plans, 4 channels, 1 smoke user.
+Temporary database removed after verification.
+
+PROHIBITED TOKEN
+Command: rg -n -i <retired-token> app -g *.py
+Result: one hit, app/compat.py only. This is the explicitly documented data/API compatibility layer.
+
