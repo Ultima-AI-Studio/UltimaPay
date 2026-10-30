@@ -4,6 +4,40 @@ Ultima Pay SDK 是 Ultima AI Studio 出品的 EVM 链上支付 SDK，提供**代
 
 它是 **Ultima Pay** 产品线的链上分发子线，与 USDT TRC-20 扫码收款（链下订单 + 查链确认）互补，统一服务于 Ultima AI 旗下产品。
 
+## USDT 聚合收款接入（五步）
+
+服务地址通过部署环境配置；本地开发默认 `http://127.0.0.1:8061`。持久 `apiKey` 与
+`secret` 只保存在商户服务端，不写入浏览器包、日志或审计明文。
+
+1. 申请并领取：`POST /api/pay/apply` 提交 `code/name/email/callbackUrl` 及至少一个链地址；响应中的 `apiKey` 仅显示一次，立即安全保存。
+2. 激活：以 `X-Pay-Key: <apiKey>` 调用 `POST /api/pay/verify`，状态变为 `active`。
+3. 下单：商户服务端以同一 `X-Pay-Key` 调用 `POST /api/pay/merchant/intents`，取得短期 `sessionToken`；浏览器只使用该订单级 token。
+4. 收款确认：UltimaPay 轮询链上原始交易，经最小单位、资产、收款方、深度和连续四轮核验后将订单置为 `confirmed`。
+5. 接收回调：平台向申请时的 `callbackUrl` 投递 `payment.verified`；按 `event_id` 幂等，并用当前商户级 `secret` 校验 HMAC-SHA256 签名。管理员轮换 secret 时新值同样只显示一次，旧值立即失效。
+
+最短服务端示例：
+
+```js
+const applied = await fetch(`${base}/api/pay/apply`, {
+  method: 'POST', headers: {'content-type': 'application/json'},
+  body: JSON.stringify({code: 'shop', name: 'Shop', email: 'ops@example.com',
+    callbackUrl: 'https://shop.example/pay/callback', tronAddress: 'T...'})
+}).then(r => r.json());
+const apiKey = applied.data.apiKey; // 仅本次响应可见；写入服务端密钥库
+await fetch(`${base}/api/pay/verify`, {method: 'POST', headers: {'X-Pay-Key': apiKey}});
+```
+
+### 回调密钥语义
+
+| 订单类型 | 密钥 | 用途 |
+|---|---|---|
+| 外部商户订单 | 当前商户的 `secret` | 入站 `/api/pay/callback` 与出站 `payment.verified` 均只认该商户密钥 |
+| 平台自有 `ultima-gold` 订单 | 平台 `callbackSecret` | 仅平台自有单使用，不能代替外部商户密钥 |
+
+入站回执把请求 JSON 按键排序并使用紧凑分隔符序列化，再计算
+`HMAC-SHA256(secret, canonicalJson)`，放入 `X-Pay-Signature`。出站事件签名串为
+`event_id|order_no|payload`；接入方先验签，再按 `event_id` 幂等处理。
+
 ## 依赖要求
 
 本 SDK 依赖 `ethers v6` 作为核心依赖，使用前请确保安装：

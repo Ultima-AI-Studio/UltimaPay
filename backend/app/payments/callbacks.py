@@ -23,41 +23,90 @@ def sign_payload(secret, event_id, order_no, payload_json):
                     hashlib.sha256).hexdigest()
 
 
+def sign_inbound_callback(secret, payload):
+    """HMAC-SHA256 over canonical JSON for the inbound receipt endpoint."""
+    canonical = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(',', ':')
+    )
+    return hmac.new(
+        (secret or '').encode('utf-8'), canonical.encode('utf-8'), hashlib.sha256
+    ).hexdigest()
+
+
 def _default_post(url, data, timeout=10):
     req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.status
 
 
-def deliver_callbacks(db, secret='', batch=10, http_post=None, now=None):
+def _callback_secret(db, order_no):
+    row = db.execute(
+        "SELECT merchant FROM payment_orders WHERE order_no=?", (order_no,)
+    ).fetchone()
+    merchant = row[0] if row else ""
+    if merchant == "ultima-gold":
+        config = db.execute(
+            "SELECT callback_secret FROM payment_config WHERE id=1"
+        ).fetchone()
+        return (config[0] if config else "") or ""
+    secret = db.execute(
+        "SELECT secret FROM payment_merchants WHERE code=?", (merchant,)
+    ).fetchone()
+    return (secret[0] if secret else "") or ""
+
+
+def _set_callback_status(db, order_no, status):
+    db.execute(
+        "UPDATE payment_orders SET callback_status=? WHERE order_no=?",
+        (status, order_no),
+    )
+    db.commit()
+
+
+def _record_failure(db, ev, error, now):
+    mark_failed(db, ev['event_id'], error, now=now)
+    status = db.execute(
+        "SELECT status FROM payment_events WHERE event_id=?", (ev['event_id'],)
+    ).fetchone()[0]
+    _set_callback_status(db, ev['order_no'], status)
+    return status
+
+
+def deliver_callbacks(db, batch=10, http_post=None, now=None):
     """投递一批到期事件。http_post(url, body_bytes) 可注入（测试用）。
-    返回 (delivered_count, failed_count)。"""
+    密钥按事件所属订单解析；返回 delivered/failed/dead 统计。"""
     http_post = http_post or _default_post
     evs = claim_events(db, batch=batch, now=now)
-    delivered = failed = 0
+    stats = {'delivered': 0, 'failed': 0, 'dead': 0}
     for ev in evs:
         payload = dict(ev['payload'])
         payload['event_id'] = ev['event_id']
         payload['order_no'] = ev['order_no']
+        secret = _callback_secret(db, ev['order_no'])
+        if not secret:
+            status = _record_failure(db, ev, '缺少 callback secret', now)
+            stats[status] += 1
+            continue
         payload['signature'] = sign_payload(secret, ev['event_id'], ev['order_no'],
                                             json.dumps(payload, ensure_ascii=False, sort_keys=True))
         url = (payload.get('callback_url') or '').strip()
         if not url:
-            mark_failed(db, ev['event_id'], '缺少 callback_url', now=now)
-            failed += 1
+            status = _record_failure(db, ev, '缺少 callback_url', now)
+            stats[status] += 1
             continue
         try:
             status = http_post(url, json.dumps(payload, ensure_ascii=False).encode('utf-8'))
             if 200 <= int(status) < 300:
                 mark_delivered(db, ev['event_id'], now=now)
-                delivered += 1
+                _set_callback_status(db, ev['order_no'], 'success')
+                stats['delivered'] += 1
             else:
-                mark_failed(db, ev['event_id'], 'HTTP %s' % status, now=now)
-                failed += 1
+                event_status = _record_failure(db, ev, 'HTTP %s' % status, now)
+                stats[event_status] += 1
         except Exception as e:
-            mark_failed(db, ev['event_id'], '%s' % e, now=now)
-            failed += 1
-    return delivered, failed
+            event_status = _record_failure(db, ev, '%s' % e, now)
+            stats[event_status] += 1
+    return stats
 
 
 def fulfillment_status(db, order_no):

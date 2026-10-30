@@ -9,7 +9,6 @@ payments —— 支付域（UGP-06 从 feed_server 抽出，逻辑单份权威�
 DB 通过 `db` 参数注入；外部 Provider（链上 RPC、出站回调）调用发生在函数执行时。
 模块 import 无副作用。
 """
-import hashlib
 import hmac
 import json
 import os
@@ -349,11 +348,11 @@ def conn_row(db, order_no):
 
 
 def confirm_payment_order(db, order_no, tx_hash, amount_usdt=None, source='receipt'):
-    """提交支付回执 → 进入等待核验（submitted），不直接确认到账。
+    """Deprecated receipt intake: enter submitted, never confirm payment.
 
     UGP-03 止血规则：
-    - 仅 source='onchain'（通过链上深度/连续确认的核验流程）可写 confirmed；
-      该流程当前未实现（见 UGP-16），故任何路径都不会自动 settled。
+    - confirmed 仅由 verify_receipt → record_verified_payment 链路写入；
+      本函数不属于该可信链路，source='onchain' 也不会绕过核验。
     - 客户端回执 / 手动核销 / 外部回调 / 轮询记录（receipt/manual/callback/poll）
       一律只标记 submitted，不开通权益、不发确认回调，返回「等待核验」。
     - 空哈希、任意哈希提交均不会增加权益或写 confirmed。
@@ -375,71 +374,6 @@ def confirm_payment_order(db, order_no, tx_hash, amount_usdt=None, source='recei
                (tx_hash or '', now, order_no))
     db.commit()
     return payment_row(conn_row(db, order_no)), None
-
-
-def deliver_merchant_callback(db, order_no):
-    """订单确认后向接入方 callback_url 推送支付结果（出站回调，HMAC-SHA256 签名）。
-    接入方无 callback_url → 标记 skipped（不重试）；发送失败 → failed 交轮询重试。"""
-    try:
-        row = conn_row(db, order_no)
-        if not row or row[9] != 'confirmed':
-            return
-        merchant_code = row[15]
-        if not merchant_code:
-            return
-        m = db.execute('SELECT code, callback_url, secret FROM payment_merchants WHERE code=?', (merchant_code,)).fetchone()
-        if not m:
-            return
-        callback_url = (m[1] or '').strip()
-        secret = m[2] or ''
-        payload = {
-            'event': 'payment.confirmed',
-            'orderNo': row[1],
-            'merchantCode': merchant_code,
-            'username': row[2],
-            'planId': row[3],
-            'planName': row[4],
-            'amountUsdt': round(row[7], 2),
-            'tail': row[8],
-            'channel': row[14],
-            'txHash': row[10],
-            'confirmedAt': row[12],
-            'status': 'confirmed',
-        }
-        now = now_iso()
-        if not callback_url:
-            db.execute("UPDATE payment_orders SET callback_status='skipped', callback_at=? WHERE order_no=?", (now, order_no))
-            db.commit()
-            return
-        attempts = (row[19] or 0) + 1
-        body = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode('utf-8')
-        headers = {'Content-Type': 'application/json', 'User-Agent': 'UltimaPay/1.0'}
-        if secret:
-            headers['X-Pay-Signature'] = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
-        req = urllib.request.Request(callback_url, data=body, headers=headers, method='POST')
-        ok = False
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                ok = resp.status in (200, 201, 202, 204)
-        except Exception as e:
-            _log('出站回调失败 %s -> %s: %s' % (order_no, callback_url, e))
-        db.execute("UPDATE payment_orders SET callback_status=?, callback_at=?, callback_attempts=? WHERE order_no=?",
-                   ('success' if ok else 'failed', now, attempts, order_no))
-        db.commit()
-        _log('出站回调 %s: %s (attempt %d)' % (order_no, 'success' if ok else 'failed', attempts))
-    except Exception as e:
-        _log('出站回调异常 %s: %s' % (order_no, e))
-
-
-def retry_payment_callbacks(db):
-    """轮询补发：已确认但回调未成功的订单（failed/pending/空），最多重试 5 次。"""
-    rows = db.execute(
-        "SELECT order_no FROM payment_orders WHERE status='confirmed'"
-        " AND (callback_status IS NULL OR callback_status IN ('', 'failed', 'pending'))"
-        " AND callback_attempts < 5").fetchall()
-    for (order_no,) in rows:
-        deliver_merchant_callback(db, order_no)
-    return len(rows)
 
 
 def expire_stale_orders(db):
@@ -468,7 +402,10 @@ def merchant_secret_ok(db, code, secret):
 
 
 def fetch_trc20_incoming(db, address):
-    """主动查链：拉取收款地址最近 USDT（TRC-20）入账（金额=最小单位/1e6，含哈希）。
+    """主动查链：拉取收款地址最近 USDT（TRC-20）原始事件。
+
+    保留最小单位、合约和交易字段供 verification.parse_trc20_event 严格核验；
+    仅补充当前深度并把 TronGrid 毫秒时间戳归一为 Unix 秒。
     遍历 TRON RPC 池（主端点连不上自动切换备选），全部失败返回空并记日志。"""
     pool = _rpc_list(db, 'TRON') or [TRONGRID_URL]
     last_err = None
@@ -482,18 +419,31 @@ def fetch_trc20_incoming(db, address):
             url += '?only_confirmed=true&only_to=true&limit=200'
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
             data = json.loads(urllib.request.urlopen(req, timeout=10).read().decode())
+            origin = base.split('/v1/accounts/', 1)[0]
+            head_req = urllib.request.Request(
+                origin + '/wallet/getnowblock', data=b'{}',
+                headers={'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0'})
+            head = json.loads(urllib.request.urlopen(head_req, timeout=10).read().decode())
+            latest = int((((head.get('block_header') or {}).get('raw_data') or {}).get('number')))
             out = []
             for t in data.get('data', []) or []:
                 sym = (t.get('token_info') or {}).get('symbol', '')
                 if sym != 'USDT':
                     continue
                 try:
-                    amount = round(int(t.get('value', 0)) / 1e6, 2)
-                except Exception:
+                    block = int(t.get('block_number'))
+                    int(t.get('value'))
+                except (TypeError, ValueError):
                     continue
-                out.append({'hash': t.get('transaction_id'), 'amount': amount,
-                            'from': t.get('from'), 'to': t.get('to'),
-                            'time': t.get('block_timestamp')})
+                event = dict(t)
+                timestamp = event.get('block_timestamp')
+                if timestamp is not None:
+                    timestamp = int(timestamp)
+                    if timestamp > 10_000_000_000:
+                        timestamp //= 1000
+                    event['block_timestamp'] = timestamp
+                event['depth'] = max(0, latest - block + 1)
+                out.append(event)
             return out
         except Exception as e:
             last_err = '%s' % e
@@ -551,21 +501,23 @@ def fetch_evm_incoming(db, address, chain='ETH'):
     if not logs:
         return []
     out = []
+    block_times = {}
     for lg in logs:
-        data = lg.get('data') or ''
-        if len(data) < 66:
-            continue
         try:
-            raw = int(data[2:66], 16)
-        except Exception:
+            block_number = int(lg.get('blockNumber'), 16)
+            int(lg.get('data') or '0x0', 16)
+        except (TypeError, ValueError):
             continue
-        amount = round(raw / (10 ** decimals), 2)
-        if amount <= 0:
-            continue
-        topics = lg.get('topics') or []
-        out.append({'hash': lg.get('transactionHash'), 'amount': amount,
-                    'from': ('0x' + topics[1][-40:]) if len(topics) > 1 and topics[1] else '',
-                    'to': address, 'time': None})
+        event = dict(lg)
+        event['depth'] = max(0, latest_int - block_number + 1)
+        if block_number not in block_times:
+            block_data = evm_rpc_call(db, chain, 'eth_getBlockByNumber',
+                                      [hex(block_number), False]) or {}
+            timestamp = block_data.get('timestamp')
+            block_times[block_number] = int(timestamp, 16) if timestamp else None
+        event['block_time'] = block_times[block_number]
+        event['confirmed'] = not bool(event.get('removed'))
+        out.append(event)
     return out
 
 
@@ -591,7 +543,7 @@ def solana_rpc(db, method, params):
 
 
 def fetch_solana_incoming(db, address):
-    """主动查链：拉取 Solana 收款地址最近 USDT（SPL-token）入账。"""
+    """主动查链：返回可由 parse_solana_tx 严格核验的原始交易。"""
     sigs = solana_rpc(db, 'getSignaturesForAddress', [address, {'limit': 30}])
     if not sigs:
         return []
@@ -602,34 +554,9 @@ def fetch_solana_incoming(db, address):
         tx = solana_rpc(db, 'getTransaction', [s['signature'], {'encoding': 'jsonParsed', 'maxSupportedTransactionVersion': 0}])
         if not tx:
             continue
-        meta = tx.get('meta') or {}
-        inner = meta.get('innerInstructions') or []
-        found = False
-        for ins in inner:
-            for ix in ins.get('instructions', []):
-                if ix.get('program') != 'spl-token':
-                    continue
-                parsed = ix.get('parsed') or {}
-                if parsed.get('type') != 'transfer':
-                    continue
-                info = parsed.get('info') or {}
-                if info.get('mint') != USDT_SPL_MINT:
-                    continue
-                if info.get('destination') != address:
-                    continue
-                amt = info.get('tokenAmount') or {}
-                try:
-                    amount = round(float(amt.get('uiAmount') or 0), 2)
-                except Exception:
-                    continue
-                if amount <= 0:
-                    continue
-                out.append({'hash': s['signature'], 'amount': amount,
-                            'from': info.get('source'), 'to': info.get('destination'),
-                            'time': (tx.get('blockTime') or 0) * 1000})
-                found = True
-                break
-            if found:
-                break
+        raw = dict(tx)
+        raw['signature'] = s['signature']
+        raw['confirmationStatus'] = s.get('confirmationStatus') or 'confirmed'
+        out.append(raw)
     return out
 

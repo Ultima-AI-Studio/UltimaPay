@@ -1,0 +1,31 @@
+Gate T0 — PASS
+Date: 2026-10-30
+
+1. T0专项
+Command: backend/.venv/Scripts/python.exe -m pytest -q tests/test_t5_business_loop.py
+Result: 10 passed in 0.09s
+
+Covered behavior:
+- 四次独立轮询观察后 verify_receipt 返回 confirmed，record_verified_payment 原子落账。
+- payment_orders=confirmed/source=live；payment_ledger 1 条；PaymentVerified outbox 1 条。
+- 金额错误、收款方错误、深度不足、交易早于订单创建均不得 confirmed。
+- tx_hash 重复返回 duplicate，不重复 ledger/event。
+- 旧 poll 回执仍只写 submitted。
+- TRON/EVM/SOL fetch 返回真实解析器可消费的 provider 结构。
+
+2. 回归
+Command: backend/.venv/Scripts/python.exe -m pytest -q
+Result: 32 passed in 1.69s
+
+3. 真实业务调用方
+Command: rg -n "verification\.verify_receipt|settlement\.record_verified_payment" backend/app
+Result:
+- app/services/payment_loop.py:101 verification.verify_receipt(...)
+- app/services/payment_loop.py:119 settlement.record_verified_payment(...)
+
+4. 旧确认依据移除
+Fixed-string searches in backend/app/services/payment_loop.py:
+- abs(amount_usdt-?)<0.005: no match
+- source="poll": no match
+Result: PASS — 浮点金额不再作为确认依据，轮询不再调用止血回执路径。
+

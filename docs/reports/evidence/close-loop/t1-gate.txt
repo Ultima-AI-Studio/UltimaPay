@@ -1,0 +1,26 @@
+Gate T1 — PASS
+Date: 2026-10-30
+
+1. T1专项
+Command: backend/.venv/Scripts/python.exe -m pytest -q tests/test_t5_business_loop.py -k "outbox or payment_iteration_runs"
+Result: 4 passed, 10 deselected in 0.09s
+
+Covered behavior:
+- 外部商户事件按商户 secret 生成 HMAC-SHA256 签名并成功 mark_delivered。
+- delivered event 再次运行不再 POST（同 event_id 成功仅一次）。
+- 网络失败 mark_failed，attempts+1，10 秒指数退避；到期可成功重试。
+- max_attempts=1 时失败进入 dead；缺 callback_url 记录“缺少 callback_url”。
+- failed/dead 场景 payment_orders.status 始终为 confirmed，callback_status 独立更新。
+- payment_loop 每轮调用 outbox deliver_callbacks 并报告 delivered/failed/dead。
+
+2. 回归
+Command: backend/.venv/Scripts/python.exe -m pytest -q
+Result: 36 passed in 1.68s
+
+3. 唯一投递路径
+Command: rg -n "callbacks\.deliver_callbacks" backend/app --glob "!payments/callbacks.py"
+Business result: backend/app/services/payment_loop.py:134
+
+Command: rg -n "retry_payment_callbacks|deliver_merchant_callback" backend/app backend/tests
+Result: no match
+

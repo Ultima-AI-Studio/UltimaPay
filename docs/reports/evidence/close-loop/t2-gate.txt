@@ -1,0 +1,24 @@
+Gate T2 — PASS
+Date: 2026-10-30
+
+1. T2接口链路
+Command: backend/.venv/Scripts/python.exe -m pytest -q tests/test_t5_business_loop.py -k credential_loop
+Result: 1 passed, 14 deselected in 0.77s
+
+Covered behavior:
+- apply 保存 callbackUrl，并以 one-time-response 一次性返回 apiKey。
+- 同 code 再申请返回 400，后续响应与管理员列表均不回显 apiKey。
+- X-Pay-Key 调用 verify 后商户状态变 active。
+- 未授权 rotate-secret 返回 401；admin 可连续轮换，两次 secret 不同。
+- merchant_secret_ok 对旧值 False、对新值 True。
+- 管理列表仅返回 apiKeyProvisioned/secretConfigured/canRotateSecret。
+- audit_logs 不包含 apiKey、旧 secret 或新 secret 明文。
+
+2. 回归
+Command: backend/.venv/Scripts/python.exe -m pytest -q
+Result: 37 passed in 1.77s
+
+3. 路由与文档
+- OpenAPI: /api/pay/merchants/{code}/rotate-secret POST present
+- sdk/README.md: 申请并领取 / 激活 / 下单 / 收款确认 / 接收回调 五步均命中
+

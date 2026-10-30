@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse, Response
 
 from .. import payments
 from ..auth import policy
-from ..payments import merchant_api, orders as payment_orders
+from ..payments import callbacks, merchant_api, orders as payment_orders
 from ..storage import ensure_payment_base_schema, open_connection
 
 
@@ -169,7 +169,9 @@ def _merchant_payloads(rows):
          "status": row[5], "applyAt": row[6] or "", "lastSeenAt": row[7] or "",
          "callbackUrl": row[8], "enabled": bool(row[10]), "remark": row[11],
          "createdAt": row[12], "tronAddress": row[13] or "", "ethAddress": row[14] or "",
-         "bscAddress": row[15] or "", "solAddress": row[16] or ""}
+         "bscAddress": row[15] or "", "solAddress": row[16] or "",
+         "apiKeyProvisioned": bool(row[4]), "secretConfigured": bool(row[9]),
+         "canRotateSecret": True}
         for row in rows
     ]
 
@@ -189,6 +191,39 @@ def get_merchants(authorization: str | None = Header(default=None)):
     db = _db()
     try:
         return _ok({"merchants": _merchant_payloads(_merchant_rows(db))})
+    finally:
+        db.close()
+
+
+@router.post("/merchants/{code}/rotate-secret")
+def rotate_merchant_secret(code: str, authorization: str | None = Header(default=None)):
+    if not _admin_ok(authorization):
+        return _error(401, "未授权：需要管理令牌")
+    db = _db()
+    try:
+        merchant = db.execute(
+            "SELECT code FROM payment_merchants WHERE code=?", (code,)
+        ).fetchone()
+        if not merchant:
+            return _error(404, "接入方不存在")
+        secret = payments.rotate_merchant_secret(db, code)
+        principal = {"role": "admin", "user_id": "admin", "username": "admin"}
+        policy.audit_sensitive(
+            db,
+            principal,
+            "rotate_secret",
+            "merchant:credentials",
+            "merchant=%s secret=****" % code,
+            raw_secrets=(secret,),
+        )
+        return _ok(
+            {
+                "code": code,
+                "secret": secret,
+                "credentialDelivery": "one-time-response",
+                "message": "新 secret 仅在本次响应返回，旧值已立即失效",
+            }
+        )
     finally:
         db.close()
 
@@ -280,10 +315,11 @@ def apply_merchant(body: dict):
             return _error(400, "该代号已被占用，请换一个")
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         api_key = "upay_live_" + secrets.token_hex(12)
+        callback_url = str(body.get("callbackUrl") or "").strip()
         db.execute(
-            "INSERT INTO payment_merchants(code,name,email,api_key,status,apply_at,remark,created_at,"
-            "tron_address,eth_address,bsc_address,sol_address) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-            (code, name, email, api_key, "applied", now,
+            "INSERT INTO payment_merchants(code,name,email,api_key,status,apply_at,callback_url,remark,created_at,"
+            "tron_address,eth_address,bsc_address,sol_address) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (code, name, email, api_key, "applied", now, callback_url,
              str(body.get("remark") or "").strip() or "网站自助申请", now, *addresses),
         )
         db.commit()
@@ -292,7 +328,8 @@ def apply_merchant(body: dict):
         ).fetchone()
         return _ok({"id": row[0], "code": row[1], "name": row[2], "email": row[3],
                     "status": row[4], "applyAt": row[5],
-                    "message": "申请成功，接入凭证已生成（SDK 接入包将发送至邮箱）"})
+                    "apiKey": api_key, "credentialDelivery": "one-time-response",
+                    "message": "申请成功；apiKey 仅在本次响应返回，请立即安全保存后调用 verify 激活"})
     finally:
         db.close()
 
@@ -560,17 +597,31 @@ def admin_create_order(body: dict, authorization: str | None = Header(default=No
 
 
 @router.post("/callback")
-def payment_callback(body: dict, x_pay_secret: str | None = Header(default=None)):
+def payment_callback(body: dict, x_pay_signature: str | None = Header(default=None)):
     db = _db()
     try:
-        secret = payments.read_payment_config(db)["callbackSecret"]
+        order_no = str(body.get("orderNo") or "")
+        order = db.execute(
+            "SELECT merchant FROM payment_orders WHERE order_no=?", (order_no,)
+        ).fetchone()
+        if not order:
+            return _error(404, "订单不存在")
+        merchant = order[0] or "ultima-gold"
+        if merchant == "ultima-gold":
+            secret = payments.read_payment_config(db)["callbackSecret"]
+        else:
+            merchant_row = db.execute(
+                "SELECT secret FROM payment_merchants WHERE code=?", (merchant,)
+            ).fetchone()
+            secret = (merchant_row[0] if merchant_row else "") or ""
         if not secret:
             return _error(403, "回调密钥未配置，拒绝处理回调")
-        if not x_pay_secret or not secrets.compare_digest(x_pay_secret, secret):
-            return _error(403, "回调密钥校验失败")
+        expected = callbacks.sign_inbound_callback(secret, body)
+        if not x_pay_signature or not secrets.compare_digest(x_pay_signature, expected):
+            return _error(401, "回调签名校验失败")
         amount = body.get("amountUsdt")
         row, error = payments.confirm_payment_order(
-            db, body.get("orderNo") or "", body.get("txHash") or "",
+            db, order_no, body.get("txHash") or "",
             float(amount) if amount is not None else None, source="callback"
         )
         return _error(400, error) if error else _ok(row)
