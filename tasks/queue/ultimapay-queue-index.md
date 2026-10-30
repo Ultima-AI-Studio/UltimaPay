@@ -8,14 +8,14 @@
 
 | 工单数 | 待派发 | 执行中 | 审计中 | 阻塞 | 已冻结 |
 |---|---|---|---|---|---|
-| 2 | 0 | 0 | 0 | 0 | 2 |
+| 2 | 0 | 0 | 0 | 1 | 1 |
 
 ## 二、工单明细
 
 | 工单 | 标题 | 状态 | 前置冻结 | 验收门 | 依据 |
 |---|---|---|---|---|---|
 | wo-ultimapay-20261029-0001 | UltimaPay｜重构｜从 UltimaGold 拆出为独立支付产品 | 已冻结 | 无 | stage-split-v1.md + wo-ultimapay-20261029-0001-frozen | T0–Tn 全绿；独立审计 4 项重要发现均已修复；用户要求的支付逻辑/后端/DB/路由与 Gold 解耦完成 |
-| wo-ultimapay-20261030-0002 | UltimaPay｜修复｜业务闭环打通（链上确认→落账→履约通知 + 接入凭证交付） | 已冻结 | wo-ultimapay-20261029-0001-frozen | stage-close-loop.md + wo-ultimapay-20261030-0002-frozen | T0-T4 与 Tn 本地全绿；独立审查 7 项 Important 全部 RED→GREEN 修复；后端 45/45、SDK 10/10、双构建通过 |
+| wo-ultimapay-20261030-0002 | UltimaPay｜修复｜业务闭环打通（链上确认→落账→履约通知 + 接入凭证交付） | 阻塞（仅远端同步） | wo-ultimapay-20261029-0001-frozen | stage-close-loop.md + wo-ultimapay-20261030-0002-frozen | 本地 T0-Tn 全绿、tag 已建；独立审查 7 项 Important 全修复；后端 45/45、SDK 10/10、双构建通过；GitHub push 因代理未运行/直连 reset 未完成 |
 
 ## 三、回执与证据
 

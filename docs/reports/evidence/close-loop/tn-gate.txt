@@ -1,4 +1,4 @@
-Gate Tn — PASS (local verification)
+Gate Tn — PASS (local verification) / BLOCKED (remote sync only)
 Date: 2026-10-30
 
 Backend final:
@@ -35,4 +35,11 @@ Environment evidence:
 
 Freeze target:
 - commit + tag: wo-ultimapay-20261030-0002-frozen
-- tag resolution and remote push are executed after this evidence is committed.
+- local tag resolved successfully to the freeze commit.
+- repository had no configured remote; authoritative same-name GitHub URL was probed.
+- 127.0.0.1:1080 and :1083 proxy ports: not listening.
+- gh api user: TLS handshake timeout.
+- direct git push main --tags with all proxy settings cleared: connection reset, exit 1.
+- remote push is not complete; no claim of remote synchronization is made.
+- tag was initially created before this environment result existed, then retargeted locally
+  before any successful push so the freeze anchor includes the actual push-failure evidence.
