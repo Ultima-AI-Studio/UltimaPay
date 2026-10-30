@@ -1,0 +1,38 @@
+Gate Tn — PASS (local verification)
+Date: 2026-10-30
+
+Backend final:
+- backend/.venv/Scripts/python.exe -m pytest -q
+  45 passed in 2.22s
+- backend/.venv/Scripts/python.exe -m compileall -q app migrations run.py
+  exit 0
+- business-loop focused file after review fixes
+  23 passed in 1.02s
+
+Independent review repair:
+- Fresh reviewer verdict before fixes: Ready — No; 7 Important, 1 Minor.
+- Added 8 reproductions; RED: 8 failed for the expected defects.
+- GREEN: 8 passed, 15 deselected in 0.20s.
+- Full backend after fixes: 45 passed, 0 failed.
+- Important findings fixed: confirmation rollback/interruption, EVM missing timestamp,
+  documented TronGrid shape, standard Solana transferChecked ownership, late submitted
+  transfer, delivered terminality, exclusive outbox claim.
+- Deferred Minor: README verify JavaScript example omits an explicit empty JSON body.
+
+SDK final:
+- npm test: 1 test file, 10 tests passed.
+- npm run build: tsup CJS/ESM/DTS success.
+- PayWindow npm run build (clean isolated dependency layout): tsc + Vite success,
+  1403 modules transformed, built in 4.58s.
+
+Environment evidence:
+- pnpm/H: mixed node_modules layout reproduced Vite browser buffer resolution failure.
+- Clean npm no-lock layout built the identical tracked PayWindow source successfully.
+- Generated node_modules directories were moved out of sdk source paths after verification;
+  backend contract test confirms no dependency/build directory pollution.
+- npm reported 5 existing transitive dependency vulnerabilities (1 low, 2 moderate,
+  2 critical); no force upgrade was performed outside this work order.
+
+Freeze target:
+- commit + tag: wo-ultimapay-20261030-0002-frozen
+- tag resolution and remote push are executed after this evidence is committed.

@@ -96,16 +96,22 @@ def deliver_callbacks(db, batch=10, http_post=None, now=None):
             continue
         try:
             status = http_post(url, json.dumps(payload, ensure_ascii=False).encode('utf-8'))
-            if 200 <= int(status) < 300:
-                mark_delivered(db, ev['event_id'], now=now)
-                _set_callback_status(db, ev['order_no'], 'success')
-                stats['delivered'] += 1
-            else:
-                event_status = _record_failure(db, ev, 'HTTP %s' % status, now)
-                stats[event_status] += 1
         except Exception as e:
             event_status = _record_failure(db, ev, '%s' % e, now)
             stats[event_status] += 1
+            continue
+        if not 200 <= int(status) < 300:
+            event_status = _record_failure(db, ev, 'HTTP %s' % status, now)
+            stats[event_status] += 1
+            continue
+        mark_delivered(db, ev['event_id'], now=now)
+        stats['delivered'] += 1
+        try:
+            _set_callback_status(db, ev['order_no'], 'success')
+        except Exception:
+            # The remote already acknowledged this event.  delivered is terminal;
+            # local summary bookkeeping must never turn it into a retry.
+            pass
     return stats
 
 

@@ -431,11 +431,26 @@ def fetch_trc20_incoming(db, address):
                 if sym != 'USDT':
                     continue
                 try:
-                    block = int(t.get('block_number'))
                     int(t.get('value'))
                 except (TypeError, ValueError):
                     continue
                 event = dict(t)
+                block = event.get('block_number')
+                if block is None:
+                    tx_req = urllib.request.Request(
+                        origin + '/wallet/gettransactioninfobyid',
+                        data=json.dumps({'value': event.get('transaction_id')}).encode('utf-8'),
+                        headers={'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0'})
+                    tx_info = json.loads(urllib.request.urlopen(tx_req, timeout=10).read().decode())
+                    receipt_result = ((tx_info.get('receipt') or {}).get('result') or 'SUCCESS').upper()
+                    if receipt_result != 'SUCCESS':
+                        continue
+                    block = tx_info.get('blockNumber')
+                try:
+                    block = int(block)
+                except (TypeError, ValueError):
+                    continue
+                event['block_number'] = block
                 timestamp = event.get('block_timestamp')
                 if timestamp is not None:
                     timestamp = int(timestamp)
@@ -443,6 +458,7 @@ def fetch_trc20_incoming(db, address):
                         timestamp //= 1000
                     event['block_timestamp'] = timestamp
                 event['depth'] = max(0, latest - block + 1)
+                event['_observation_block'] = latest
                 out.append(event)
             return out
         except Exception as e:
@@ -514,9 +530,15 @@ def fetch_evm_incoming(db, address, chain='ETH'):
             block_data = evm_rpc_call(db, chain, 'eth_getBlockByNumber',
                                       [hex(block_number), False]) or {}
             timestamp = block_data.get('timestamp')
-            block_times[block_number] = int(timestamp, 16) if timestamp else None
+            try:
+                block_times[block_number] = int(timestamp, 16) if timestamp else None
+            except (TypeError, ValueError):
+                block_times[block_number] = None
+        if block_times[block_number] is None:
+            continue
         event['block_time'] = block_times[block_number]
         event['confirmed'] = not bool(event.get('removed'))
+        event['_observation_block'] = latest_int
         out.append(event)
     return out
 
@@ -547,6 +569,9 @@ def fetch_solana_incoming(db, address):
     sigs = solana_rpc(db, 'getSignaturesForAddress', [address, {'limit': 30}])
     if not sigs:
         return []
+    observation_slot = solana_rpc(db, 'getSlot', [{'commitment': 'finalized'}])
+    if observation_slot is None:
+        return []
     out = []
     for s in sigs:
         if not s.get('err') is None:  # 失败交易跳过
@@ -554,9 +579,42 @@ def fetch_solana_incoming(db, address):
         tx = solana_rpc(db, 'getTransaction', [s['signature'], {'encoding': 'jsonParsed', 'maxSupportedTransactionVersion': 0}])
         if not tx:
             continue
-        raw = dict(tx)
+        raw = json.loads(json.dumps(tx))
         raw['signature'] = s['signature']
         raw['confirmationStatus'] = s.get('confirmationStatus') or 'confirmed'
+        raw['_observation_block'] = int(observation_slot)
+        parsed_groups = [((raw.get('transaction') or {}).get('message') or {}).get('instructions') or []]
+        parsed_groups.extend(
+            group.get('instructions') or []
+            for group in (raw.get('meta') or {}).get('innerInstructions') or []
+        )
+        trustworthy = True
+        found_transfer = False
+        for instructions in parsed_groups:
+            for instruction in instructions:
+                parsed = instruction.get('parsed') or {}
+                if parsed.get('type') != 'transferChecked':
+                    continue
+                found_transfer = True
+                info = parsed.get('info') or {}
+                token_amount = info.get('tokenAmount') or {}
+                if info.get('amount') is None and token_amount.get('amount') is not None:
+                    info['amount'] = token_amount['amount']
+                if not info.get('ataFor'):
+                    account = solana_rpc(
+                        db, 'getAccountInfo',
+                        [info.get('destination'), {'encoding': 'jsonParsed', 'commitment': 'finalized'}]
+                    ) or {}
+                    account_info = (((account.get('value') or {}).get('data') or {}).get('parsed') or {}).get('info') or {}
+                    if (not account_info.get('owner')
+                            or account_info.get('mint') != info.get('mint')):
+                        trustworthy = False
+                        break
+                    info['ataFor'] = account_info['owner']
+            if not trustworthy:
+                break
+        if not trustworthy or not found_transfer:
+            continue
         out.append(raw)
     return out
 

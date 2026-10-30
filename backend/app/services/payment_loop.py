@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
+from datetime import datetime
 
 from .. import payments
-from ..payments import callbacks, settlement, verification
+from ..payments import callbacks, orders as payment_orders, settlement, verification
 from ..storage import ensure_payment_base_schema, open_connection
 
 
@@ -28,18 +30,25 @@ class _PollingConfirmationTracker:
     """
 
     def __init__(self, rounds=verification.CONFIRMATION_ROUNDS):
-        self.rounds = rounds
-        self.count = 0
+        self._tracker = verification.ConfirmationTracker(rounds=rounds)
+        self._observation = None
 
-    def observe(self, _block_ref, _timestamp=None):
-        self.count += 1
-        return self.count
+    def prepare(self, block_ref):
+        self._observation = (block_ref, time.monotonic_ns())
+
+    def observe(self, block_ref, timestamp=None):
+        observation = self._observation or (block_ref, timestamp)
+        return self._tracker.observe(*observation)
+
+    @property
+    def count(self):
+        return self._tracker.count
 
     def confirmed(self):
-        return self.count >= self.rounds
+        return self._tracker.confirmed()
 
     def reset(self):
-        self.count = 0
+        self._tracker.reset()
 
 
 def live_payment_enabled() -> bool:
@@ -58,6 +67,7 @@ def _verification_intent(row):
         "amount_units": row["amount_units"],
         "receive_address": row["receive_address"],
         "created_at": row["created_at"],
+        "expired_at": row["expired_at"],
     }
 
 
@@ -70,7 +80,7 @@ def _poll_and_settle(db) -> dict[str, int]:
         return stats
     pending = db.execute(
         "SELECT order_no, receive_address, channel, merchant, amount_units,"
-        " asset_key, created_at FROM payment_orders"
+        " asset_key, created_at, expired_at FROM payment_orders"
         " WHERE status IN ('pending','submitted','confirming')"
         " AND amount_units IS NOT NULL AND asset_key IS NOT NULL"
     ).fetchall()
@@ -79,6 +89,7 @@ def _poll_and_settle(db) -> dict[str, int]:
         address = row["receive_address"] or cfg["address"]
         grouped.setdefault((address, row["channel"] or "TRON"), []).append(row)
     seen = set()
+    active_orders = {row["order_no"] for row in pending}
     for (address, channel), orders in grouped.items():
         if channel == "SOL":
             incoming = payments.fetch_solana_incoming(db, address)
@@ -98,7 +109,13 @@ def _poll_and_settle(db) -> dict[str, int]:
                 tracker = _VERIFICATION_TRACKERS.setdefault(
                     candidate, _PollingConfirmationTracker()
                 )
-                evidence, status, _reason = verification.verify_receipt(
+                observation_block = transaction.get("_observation_block")
+                if observation_block is None:
+                    observation_block = transaction.get("block_number")
+                if observation_block is None:
+                    observation_block = transaction.get("slot")
+                tracker.prepare(observation_block)
+                evidence, status, reason = verification.verify_receipt(
                     _verification_intent(row),
                     (row["channel"] or "TRON").lower(),
                     transaction,
@@ -108,8 +125,28 @@ def _poll_and_settle(db) -> dict[str, int]:
                 if status == "rejected":
                     _VERIFICATION_TRACKERS.pop(candidate, None)
                     continue
+                if status == "pending" and not reason.startswith("连续确认不足"):
+                    _VERIFICATION_TRACKERS.pop(candidate, None)
+                    continue
                 if status != "confirmed" or evidence is None:
                     continue
+                if evidence.block_time is None:
+                    _VERIFICATION_TRACKERS.pop(candidate, None)
+                    continue
+                expires_at = row["expired_at"]
+                if expires_at:
+                    expiry_ts = datetime.strptime(
+                        expires_at[:19], "%Y-%m-%d %H:%M:%S"
+                    ).timestamp()
+                    if evidence.block_time > expiry_ts:
+                        payment_orders._audit_exception(
+                            db,
+                            row["order_no"],
+                            "链上交易超出订单时间窗",
+                            evidence.tx_hash,
+                        )
+                        _VERIFICATION_TRACKERS.pop(candidate, None)
+                        continue
                 stats["verified"] += 1
                 merchant = db.execute(
                     "SELECT callback_url FROM payment_merchants WHERE code=?",
@@ -122,6 +159,9 @@ def _poll_and_settle(db) -> dict[str, int]:
                 if result in ("recorded", "duplicate"):
                     stats[result] += 1
                     _VERIFICATION_TRACKERS.pop(candidate, None)
+    for candidate in list(_VERIFICATION_TRACKERS):
+        if candidate[0] in active_orders and candidate not in seen:
+            _VERIFICATION_TRACKERS.pop(candidate, None)
     return stats
 
 

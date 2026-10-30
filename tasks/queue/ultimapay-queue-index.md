@@ -8,15 +8,15 @@
 
 | 工单数 | 待派发 | 执行中 | 审计中 | 阻塞 | 已冻结 |
 |---|---|---|---|---|---|
-| 2 | 0 | 1 | 0 | 0 | 1 |
+| 2 | 0 | 0 | 0 | 0 | 2 |
 
 ## 二、工单明细
 
 | 工单 | 标题 | 状态 | 前置冻结 | 验收门 | 依据 |
 |---|---|---|---|---|---|
 | wo-ultimapay-20261029-0001 | UltimaPay｜重构｜从 UltimaGold 拆出为独立支付产品 | 已冻结 | 无 | stage-split-v1.md + wo-ultimapay-20261029-0001-frozen | T0–Tn 全绿；独立审计 4 项重要发现均已修复；用户要求的支付逻辑/后端/DB/路由与 Gold 解耦完成 |
-| wo-ultimapay-20261030-0002 | UltimaPay｜修复｜业务闭环打通（链上确认→落账→履约通知 + 接入凭证交付） | 执行中 | wo-ultimapay-20261029-0001-frozen | stage-close-loop.md + wo-ultimapay-20261030-0002-frozen | 2026-10-30 独立业务审计发现 2 处闭环断裂（确认→落账链路无调用方、接入凭证无交付渠道）+ 2 处不一致（回调密钥语义、双回调重试）；工单 T0–Tn 已建，派发 Codex gpt-5.6-sol |
+| wo-ultimapay-20261030-0002 | UltimaPay｜修复｜业务闭环打通（链上确认→落账→履约通知 + 接入凭证交付） | 已冻结 | wo-ultimapay-20261029-0001-frozen | stage-close-loop.md + wo-ultimapay-20261030-0002-frozen | T0-T4 与 Tn 本地全绿；独立审查 7 项 Important 全部 RED→GREEN 修复；后端 45/45、SDK 10/10、双构建通过 |
 
 ## 三、回执与证据
 
-标准化 8 字段回执见 `docs/reports/stage-split-v1.md`；审计见 `docs/reports/split-v1-audit.md`；最终证据见 `docs/reports/evidence/split-v1/tn-gate.txt`。
+拆分回执见 `docs/reports/stage-split-v1.md`；业务闭环回执见 `docs/reports/stage-close-loop.md`；最终证据见 `docs/reports/evidence/close-loop/tn-gate.txt`。

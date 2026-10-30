@@ -44,14 +44,29 @@ def enqueue_event(db, order_no, event_type, payload, now=None):
 
 
 def claim_events(db, batch=10, now=None):
-    """领取到期待投递事件（pending 或 failed 且 next_retry_at<=now、attempts<max）。
+    """原子领取到期待投递事件；processing 以 60 秒租约防并发重复投递。
     返回 [{id, event_id, order_no, event_type, payload, attempts}]；无到期项返回空。"""
     now = now or datetime.now()
-    rows = db.execute(
-        "SELECT id, event_id, order_no, event_type, payload, attempts FROM payment_events "
-        "WHERE status IN ('pending','failed') AND (next_retry_at IS NULL OR next_retry_at <= ?) "
-        "AND attempts < max_attempts ORDER BY id LIMIT ?",
-        (_fmt_dt(now), batch)).fetchall()
+    now_text = _fmt_dt(now)
+    lease_until = _fmt_dt(now + timedelta(seconds=60))
+    db.execute('BEGIN IMMEDIATE')
+    try:
+        rows = db.execute(
+            "SELECT id, event_id, order_no, event_type, payload, attempts FROM payment_events "
+            "WHERE ((status IN ('pending','failed') AND "
+            "(next_retry_at IS NULL OR next_retry_at <= ?)) "
+            "OR (status='processing' AND next_retry_at <= ?)) "
+            "AND attempts < max_attempts ORDER BY id LIMIT ?",
+            (now_text, now_text, batch)).fetchall()
+        for row in rows:
+            db.execute(
+                "UPDATE payment_events SET status='processing', next_retry_at=? WHERE id=?",
+                (lease_until, row[0]),
+            )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     out = []
     for r in rows:
         try:
@@ -64,7 +79,8 @@ def claim_events(db, batch=10, now=None):
 
 
 def mark_delivered(db, event_id, now=None):
-    db.execute("UPDATE payment_events SET status='delivered', delivered_at=?, last_error=NULL "
+    db.execute("UPDATE payment_events SET status='delivered', delivered_at=?, last_error=NULL, "
+               "next_retry_at=NULL "
                "WHERE event_id=?", (_fmt_dt(now or datetime.now()), event_id))
     db.commit()
     return True

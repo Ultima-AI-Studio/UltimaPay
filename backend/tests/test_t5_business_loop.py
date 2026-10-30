@@ -189,7 +189,8 @@ def test_legacy_poll_receipt_still_only_marks_submitted():
 
 
 def test_tron_fetch_preserves_raw_event_units_and_adds_depth(monkeypatch):
-    raw = _tron_event(block_number=100, block_timestamp=1_761_799_320_000)
+    raw = _tron_event(block_timestamp=1_761_799_320_000)
+    raw.pop("block_number")
 
     class Response:
         def __init__(self, payload):
@@ -201,6 +202,8 @@ def test_tron_fetch_preserves_raw_event_units_and_adds_depth(monkeypatch):
     def fake_open(request, timeout=10):
         if request.full_url.endswith("/wallet/getnowblock"):
             return Response({"block_header": {"raw_data": {"number": 120}}})
+        if request.full_url.endswith("/wallet/gettransactioninfobyid"):
+            return Response({"blockNumber": 100, "receipt": {"result": "SUCCESS"}})
         return Response({"data": [raw]})
 
     monkeypatch.setattr(payments.urllib.request, "urlopen", fake_open)
@@ -210,6 +213,7 @@ def test_tron_fetch_preserves_raw_event_units_and_adds_depth(monkeypatch):
 
     assert events[0]["transaction_id"] == "tx-t0-verified"
     assert events[0]["value"] == str(AMOUNT_UNITS)
+    assert events[0]["block_number"] == 100
     assert events[0]["depth"] == 21
     assert events[0]["block_timestamp"] == 1_761_799_320
 
@@ -248,6 +252,34 @@ def test_evm_fetch_returns_parseable_log_with_depth_and_block_time(monkeypatch):
     assert events[0]["block_time"] == int("69036d98", 16)
 
 
+def test_evm_fetch_defers_log_when_block_timestamp_is_unavailable(monkeypatch):
+    log = {
+        "address": payments.EVM_USDT["ETH"][0],
+        "topics": [
+            payments.TRANSFER_TOPIC,
+            "0x" + "1" * 64,
+            "0x" + "0" * 24 + "421565a03a43857bdcab534fb8c8fd1c3158e06a",
+        ],
+        "data": hex(AMOUNT_UNITS),
+        "transactionHash": "0xmissing-time",
+        "blockNumber": "0xf0",
+        "logIndex": "0x0",
+    }
+
+    def fake_rpc(db, chain, method, params):
+        return {
+            "eth_blockNumber": "0x100",
+            "eth_getLogs": [log],
+            "eth_getBlockByNumber": None,
+        }[method]
+
+    monkeypatch.setattr(payments, "evm_rpc_call", fake_rpc)
+
+    assert payments.fetch_evm_incoming(
+        _db(), "0x421565A03A43857BdcAB534FB8C8fD1C3158E06a", "ETH"
+    ) == []
+
+
 def test_solana_fetch_returns_raw_transaction_for_real_parser(monkeypatch):
     raw_tx = {
         "slot": 42,
@@ -262,10 +294,13 @@ def test_solana_fetch_returns_raw_transaction_for_real_parser(monkeypatch):
                                 "type": "transferChecked",
                                 "info": {
                                     "mint": payments.USDT_SPL_MINT,
-                                    "amount": str(AMOUNT_UNITS),
+                                    "tokenAmount": {
+                                        "amount": str(AMOUNT_UNITS),
+                                        "decimals": 6,
+                                        "uiAmount": 198.1,
+                                    },
                                     "source": "source-ata",
                                     "destination": "destination-ata",
-                                    "ataFor": "merchant-wallet",
                                     "authority": "sender-wallet",
                                 },
                             }
@@ -288,6 +323,21 @@ def test_solana_fetch_returns_raw_transaction_for_real_parser(monkeypatch):
             ]
         if method == "getTransaction":
             return raw_tx
+        if method == "getAccountInfo":
+            return {
+                "value": {
+                    "data": {
+                        "parsed": {
+                            "info": {
+                                "mint": payments.USDT_SPL_MINT,
+                                "owner": "merchant-wallet",
+                            }
+                        }
+                    }
+                }
+            }
+        if method == "getSlot":
+            return 50
         raise AssertionError(method)
 
     monkeypatch.setattr(payments, "solana_rpc", fake_rpc)
@@ -295,13 +345,78 @@ def test_solana_fetch_returns_raw_transaction_for_real_parser(monkeypatch):
 
     events = payments.fetch_solana_incoming(db, "merchant-wallet")
 
-    assert events == [
-        {
-            **raw_tx,
-            "signature": "sol-signature",
-            "confirmationStatus": "finalized",
-        }
-    ]
+    assert len(events) == 1
+    event = events[0]
+    info = event["meta"]["innerInstructions"][0]["instructions"][0]["parsed"]["info"]
+    assert info["amount"] == str(AMOUNT_UNITS)
+    assert info["ataFor"] == "merchant-wallet"
+    assert event["signature"] == "sol-signature"
+    assert event["confirmationStatus"] == "finalized"
+    assert event["_observation_block"] == 50
+
+
+def test_polling_resets_confirmation_rounds_on_block_rollback(monkeypatch):
+    db = _db()
+    _seed_order(db)
+    observations = iter([100, 101, 102, 99, 100, 101, 102, 103])
+    event = _tron_event()
+    monkeypatch.setattr(payment_loop, "live_payment_enabled", lambda: True)
+    monkeypatch.setattr(
+        payments,
+        "fetch_trc20_incoming",
+        lambda active_db, address: [{**event, "_observation_block": next(observations)}],
+    )
+    payment_loop._VERIFICATION_TRACKERS.clear()
+
+    for _ in range(4):
+        payment_loop._poll_and_settle(db)
+    assert db.execute("SELECT status FROM payment_orders").fetchone()[0] == "pending"
+
+    for _ in range(4):
+        payment_loop._poll_and_settle(db)
+    assert db.execute("SELECT status FROM payment_orders").fetchone()[0] == "confirmed"
+
+
+def test_polling_resets_confirmation_rounds_when_candidate_disappears(monkeypatch):
+    db = _db()
+    _seed_order(db)
+    responses = iter(
+        [[{**_tron_event(), "_observation_block": block}] for block in (100, 101, 102)]
+        + [[]]
+        + [[{**_tron_event(), "_observation_block": block}] for block in (103, 104, 105, 106)]
+    )
+    monkeypatch.setattr(payment_loop, "live_payment_enabled", lambda: True)
+    monkeypatch.setattr(
+        payments, "fetch_trc20_incoming", lambda active_db, address: next(responses)
+    )
+    payment_loop._VERIFICATION_TRACKERS.clear()
+
+    for _ in range(5):
+        payment_loop._poll_and_settle(db)
+    assert db.execute("SELECT status FROM payment_orders").fetchone()[0] == "pending"
+
+    for _ in range(3):
+        payment_loop._poll_and_settle(db)
+    assert db.execute("SELECT status FROM payment_orders").fetchone()[0] == "confirmed"
+
+
+def test_late_transfer_moves_submitted_order_to_exception(monkeypatch):
+    db = _db()
+    _seed_order(db)
+    db.execute(
+        "UPDATE payment_orders SET status='submitted', expired_at='2026-10-30 10:30:00'"
+    )
+    db.commit()
+    late_ts = int(datetime(2026, 10, 30, 12, 0, 0).timestamp())
+    _enable_tron_fixture(monkeypatch, _tron_event(block_timestamp=late_ts))
+
+    for _ in range(4):
+        payment_loop._poll_and_settle(db)
+
+    assert db.execute("SELECT status FROM payment_orders").fetchone()[0] == "exception"
+    reason = db.execute("SELECT reason FROM payment_order_exceptions").fetchone()[0]
+    assert "时间窗" in reason
+    assert db.execute("SELECT COUNT(*) FROM payment_ledger").fetchone()[0] == 0
 
 
 def _seed_callback_event(
@@ -440,6 +555,44 @@ def test_outbox_callback_missing_url_and_retry_cap_are_auditable():
         1,
     )
     assert dead_db.execute("SELECT status FROM payment_orders").fetchone()[0] == "confirmed"
+
+
+def test_successful_callback_remains_terminal_if_order_status_bookkeeping_fails(monkeypatch):
+    db = _db()
+    _seed_callback_event(db)
+    posted = []
+    original = callbacks._set_callback_status
+
+    def fail_success_status(active_db, order_no, status):
+        if status == "success":
+            raise sqlite3.OperationalError("bookkeeping unavailable")
+        return original(active_db, order_no, status)
+
+    monkeypatch.setattr(callbacks, "_set_callback_status", fail_success_status)
+
+    first = callbacks.deliver_callbacks(
+        db, http_post=lambda url, body: posted.append(url) or 200
+    )
+    second = callbacks.deliver_callbacks(
+        db, http_post=lambda url, body: posted.append(url) or 200
+    )
+
+    assert first == {"delivered": 1, "failed": 0, "dead": 0}
+    assert second == {"delivered": 0, "failed": 0, "dead": 0}
+    assert posted == ["https://shop.invalid/pay"]
+    assert db.execute("SELECT status FROM payment_events").fetchone()[0] == "delivered"
+
+
+def test_claim_events_exclusively_owns_pending_event():
+    db = _db()
+    _seed_callback_event(db)
+
+    first = outbox.claim_events(db, now=datetime(2026, 10, 30, 10, 0, 0))
+    second = outbox.claim_events(db, now=datetime(2026, 10, 30, 10, 0, 0))
+
+    assert len(first) == 1
+    assert second == []
+    assert db.execute("SELECT status FROM payment_events").fetchone()[0] == "processing"
 
 
 def test_payment_iteration_runs_the_single_outbox_delivery_path(monkeypatch):

@@ -1,7 +1,7 @@
 # UltimaPay 业务闭环修复阶段报告
 
 > 工单：`wo-ultimapay-20261030-0002`
-> 状态：执行中
+> 状态：T0-Tn 本地验收通过，冻结 tag 待本提交后创建
 > 环境：Windows / PowerShell / Python venv；未使用真实资金或生产 RPC
 
 ## 修复前后对比
@@ -15,11 +15,12 @@
 
 | Gate | 状态 | 证据 |
 |---|---|---|
-| T0 链上核验→落账→入队 | PASS | `evidence/close-loop/t0-gate.txt`：专项 10/10、后端全量 32/32；真实调用方 grep；旧浮点确认依据零命中 |
+| T0 链上核验→落账→入队 | PASS | `evidence/close-loop/t0-gate.txt`：专项与 provider 契约；真实调用方 grep；旧浮点确认依据零命中 |
 | T1 outbox→商户回调 | PASS | `evidence/close-loop/t1-gate.txt`：专项 4/4、后端全量 36/36；唯一投递调用方；旧重试器零命中 |
 | T2 接入凭证交付 | PASS | `evidence/close-loop/t2-gate.txt`：apply→一次性 key→verify；callbackUrl 保存；admin 轮换；全量 37/37 |
 | T3 回调密钥语义 | PASS | `evidence/close-loop/t3-gate.txt`：外部商户/平台自有正反签名；缺签名 401；全量 38/38 |
-| T4 confirmed 端到端 | PASS | `evidence/close-loop/t4-gate.txt`：业务闭环 17/17；后端全量 39/39；reconciliation matched |
+| T4 confirmed 端到端 | PASS | `evidence/close-loop/t4-gate.txt`：最终业务闭环 23/23；后端全量 45/45；reconciliation matched |
+| Tn 总验收 | PASS（本地） | `evidence/close-loop/tn-gate.txt`：pytest 45/45、compileall、SDK 10/10 + build、PayWindow build、独立审查 Important 全修复 |
 
 ## 回调投递闭环
 
@@ -47,9 +48,48 @@
 
 密钥不得出现在日志、审计明文或管理员列表；apiKey/secret 仅在各自的一次性领取响应中显示。
 
+## 独立审查与有界修复
+
+冻结前独立审查发现 7 项 Important，均以专项 RED→GREEN 在一次修复轮关闭：
+
+1. 四轮 tracker 重新委托冻结的 `ConfirmationTracker`，按 provider 观察高度识别回退；候选消失或深度失格即清零。
+2. EVM 缺可信区块时间时延后，不再绕过订单创建时间门。
+3. TRON 标准账户事件无 block number 时，查询交易信息取得权威高度、成功状态和深度。
+4. SOL 标准 `tokenAmount.amount` 归一为整数 amount，并从 `getAccountInfo` 验证 token account mint/owner 后提供 ATA 归属。
+5. submitted 晚到账超过 `expired_at` 进入可审计 exception，不自动 confirmed。
+6. HTTP 2xx 后 delivered 保持终态；订单 callback_status 记账异常不再把事件改回 failed。
+7. outbox 以 SQLite `BEGIN IMMEDIATE` + processing 租约原子领取，重叠 worker 不再同时 POST 同一 pending event。
+
+独立审查 Minor 延期：`sdk/README.md` 的 verify JavaScript 示例未显式发送 `{}` 请求体，FastAPI 会返回 422；不影响接口实现或已验证的 Python/HTTP 接入链路，留待纯文档修订。
+
+## 最终验证摘要
+
+| 命令 | 结果 |
+|---|---|
+| `backend/.venv/Scripts/python.exe -m pytest -q` | 45 passed in 2.22s |
+| `backend/.venv/Scripts/python.exe -m compileall -q app migrations run.py` | exit 0 |
+| `npm test`（sdk） | 1 file / 10 tests passed |
+| `npm run build`（sdk） | CJS / ESM / DTS build success |
+| `npm run build`（PayWindow 隔离干净 npm 布局） | TypeScript + Vite，1403 modules transformed，build success |
+
+环境说明：本机 pnpm 在 H: 盘生成的混合 node_modules 会使 Vite 无法解析 Solana 的 browser buffer；按上一冻结阶段既有裁决，在 git 忽略的工单隔离目录以 npm 无锁干净布局验证。构建依赖目录已移出项目源目录，源码与 lockfile 未为环境问题改写。npm 安装报告 5 项传递依赖漏洞（1 low / 2 moderate / 2 critical），属于既有依赖树，未执行可能破坏版本约束的自动升级。
+
 ## 边界声明
 
 - 未修改 `payments/verification.py` 的硬核对、深度门或四轮确认语义。
 - `confirm_payment_order` 的 receipt/manual/callback/poll 路径仍只写 `submitted`；confirmed 唯一入口为核验后原子落账。
 - 未接真实资金、未做存量迁移、VPS 部署或套餐定价修改。
+
+## 标准化回执
+
+| 字段 | 回执 |
+|---|---|
+| 链路号 | `wo-ultimapay-20261030-0002` |
+| 执行端 | Codex `/root` |
+| 完成状态 | T0-Tn 本地 Gate 全部 PASS；冻结 tag 随最终提交创建；远端同步以实际 push 结果为准 |
+| 根因结论 | 既有核验、落账与 outbox 模块未接入轮询业务，旧轮询只能写 submitted；商户凭证无交付渠道，入站/出站密钥与重试语义分裂 |
+| 产出路径 | `backend/app/`、`backend/tests/test_t5_business_loop.py`、`sdk/README.md`、本报告及 `evidence/close-loop/` |
+| 验收证据 | T0-T4 gate 文件 + `tn-gate.txt`；后端 45/45、SDK 10/10、双构建与 compileall |
+| 越界声明 | 无 |
+| 环境声明 | Windows/PowerShell；Python venv；Node npm 隔离构建；未使用真实资金/生产 RPC/VPS；未迁移存量数据 |
 
