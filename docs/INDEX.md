@@ -17,6 +17,7 @@
 | 顶层架构标准 | `H:\UltimaAI\ULTIMA-STANDARD.md` |
 | 任务工作流 | `H:\UltimaAI\_shared\paradigms\UltimaAI-任务工作流范式.md` |
 | Codex 执行规范 | `H:\UltimaAI\_shared\paradigms\Codex-外部执行端调用范式.md` |
+| 商户接入准入 | `docs\specs\merchant-onboarding-policy.md`（自有 Ultima 项目免 apply 直连；外部商户走标准申请） |
 | 本工单 | `tasks\queue\wo-ultimapay-20261029-0001--split-from-gold.md` |
 | 项目队列 | `tasks\queue\ultimapay-queue-index.md` |
 | 阶段报告 | `docs\reports\stage-split-v1.md` |
